@@ -1,0 +1,19 @@
+[project]
+name = "ichatbio-agent-example"
+version = "1"
+requires-python = ">=3.12"
+dependencies = [
+    "ichatbio-sdk~=0.2.1",
+    "openai~=1.79.0",
+    "pydantic~=2.11.4",
+    "instructor~=1.8.2",
+    "dotenv~=0.9.9",
+    "pytest~=8.3.5",
+    "pytest-asyncio~=1.0.0a1",
+    "uvicorn~=0.34.3"
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+log_cli = true
+log_cli_level = "INFO"
