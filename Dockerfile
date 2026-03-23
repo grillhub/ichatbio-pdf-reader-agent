@@ -4,7 +4,10 @@ RUN apt-get update -y \
       && apt-get install -y \
       python3-pip \
       python3.12-venv \
-      pipx
+      pipx \
+      libgl1 \
+      libglib2.0-0 \
+      && rm -rf /var/lib/apt/lists/*
 
 ENV PATH="/root/.local/bin:$PATH"
 RUN pipx install uv
