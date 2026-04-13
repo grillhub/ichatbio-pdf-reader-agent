@@ -7,7 +7,7 @@ import os
 import re
 import requests
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 # Try to import pypdf
 try:
@@ -19,17 +19,7 @@ except ImportError:
 
 
 def extract_pdf_urls_from_text(text: str) -> List[str]:
-    """
-    Extract PDF URLs from text using regex patterns
-    
-    Args:
-        text: Text to search for PDF URLs
-        
-    Returns:
-        List of PDF URLs found in the text
-    """
-    # Pattern to match URLs ending in .pdf or containing /pdf/ in the path
-    # Also matches common PDF hosting patterns like arxiv.org/pdf/, etc.
+
     pdf_url_patterns = [
         r'https?://[^\s<>"{}|\\^`\[\]]+\.pdf(?:\?[^\s<>"{}|\\^`\[\]]*)?',  # URLs ending in .pdf
         r'https?://[^\s<>"{}|\\^`\[\]]+/pdf/[^\s<>"{}|\\^`\[\]]+',  # URLs with /pdf/ in path
@@ -59,16 +49,6 @@ def extract_pdf_urls_from_text(text: str) -> List[str]:
 
 
 def download_pdf(url: str, output_path: str) -> str:
-    """
-    Download PDF from URL
-    
-    Args:
-        url: URL of the PDF file
-        output_path: Local path to save the PDF
-        
-    Returns:
-        Path to the downloaded PDF file
-    """
     if os.path.exists(output_path):
         print(f"PDF already exists: {output_path}")
         return output_path
@@ -89,77 +69,142 @@ def download_pdf(url: str, output_path: str) -> str:
         raise
 
 
-def read_pdf_with_pypdf(
-    pdf_path: str,
-    strategy: str = "auto",
-    include_page_breaks: bool = False,
-    infer_table_structure: bool = True
-) -> Optional[List[Dict[str, Any]]]:
-    """
-    Read and parse PDF file using pypdf library
-    
-    Args:
-        pdf_path: Path to the PDF file
-        strategy: Strategy parameter (kept for compatibility, not used with pypdf)
-        include_page_breaks: Whether to include page breaks in output
-        infer_table_structure: Whether to infer table structure (kept for compatibility, not used with pypdf)
-        
-    Returns:
-        List of document elements (simulated structure for compatibility), or None if error
-    """
+def get_pdf_num_pages(pdf_path: str) -> int:
     if not PYPDF_AVAILABLE:
         raise ImportError(
             "pypdf library is not installed. "
             "Please install it with: pip install pypdf"
         )
-    
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
-    
+    reader = PdfReader(pdf_path)
+    return len(reader.pages)
+
+
+def resolve_page_span(
+    num_pages: int,
+    start_page: int = 1,
+    end_page: Optional[int] = None,
+    max_pages: Optional[int] = None,
+) -> Tuple[int, int]:
+    if num_pages < 1:
+        raise ValueError("PDF has no pages")
+    start = max(1, int(start_page))
+    if start > num_pages:
+        raise ValueError(f"start_page {start} exceeds PDF page count {num_pages}")
+    if end_page is not None:
+        end = min(int(end_page), num_pages)
+    else:
+        end = num_pages
+    if end < start:
+        raise ValueError(f"end_page {end} is before start_page {start}")
+    if max_pages is not None:
+        cap = int(max_pages)
+        if cap < 1:
+            raise ValueError("max_pages must be at least 1 when set")
+        end = min(end, start + cap - 1)
+    return start, end
+
+
+def read_pdf_with_pypdf(
+    pdf_path: str,
+    strategy: str = "auto",
+    include_page_breaks: bool = False,
+    infer_table_structure: bool = True,
+    start_page: int = 1,
+    end_page: Optional[int] = None,
+    max_pages: Optional[int] = None,
+    text_output_path: Optional[str] = None,
+) -> Tuple[Optional[List[Dict[str, Any]]], int]:
+
+    if not PYPDF_AVAILABLE:
+        raise ImportError(
+            "pypdf library is not installed. "
+            "Please install it with: pip install pypdf"
+        )
+
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+
     print(f"Parsing PDF: {pdf_path}")
-    
+
+    text_file = None
+    if text_output_path:
+        Path(text_output_path).parent.mkdir(parents=True, exist_ok=True)
+        text_file = open(text_output_path, "w", encoding="utf-8")
+
+    char_count = 0
+    written_any = False
+
+    def _write_fragment(s: str) -> None:
+        nonlocal char_count, written_any
+        if not text_file:
+            return
+        if written_any:
+            text_file.write("\n\n")
+            char_count += 2
+        text_file.write(s)
+        char_count += len(s)
+        written_any = True
+
     try:
-        # Read PDF with pypdf
         reader = PdfReader(pdf_path)
         num_pages = len(reader.pages)
         print(f"PDF has {num_pages} pages")
-        
-        # Extract text from each page
-        elements = []
-        for page_num, page in enumerate(reader.pages, start=1):
+        first, last = resolve_page_span(num_pages, start_page, end_page, max_pages)
+        if (start_page, end_page, max_pages) != (1, None, None):
+            print(f"Processing pages {first}-{last} (inclusive) of {num_pages}")
+
+        elements: List[Dict[str, Any]] = []
+        for page_num in range(first, last + 1):
+            page = reader.pages[page_num - 1]
             try:
                 text = page.extract_text()
                 if text and text.strip():
-                    # Create a simple element structure for compatibility
+                    stripped = text.strip()
                     element = {
-                        'type': 'Text',
-                        'text': text.strip(),
-                        'page_number': page_num,
-                        'metadata': {
-                            'page_number': page_num,
-                            'total_pages': num_pages
-                        }
+                        "type": "Text",
+                        "text": stripped,
+                        "page_number": page_num,
+                        "metadata": {
+                            "page_number": page_num,
+                            "total_pages": num_pages,
+                            "extract_first_page": first,
+                            "extract_last_page": last,
+                        },
                     }
                     elements.append(element)
-                    
-                    # Add page break if requested
-                    if include_page_breaks and page_num < num_pages:
-                        elements.append({
-                            'type': 'PageBreak',
-                            'text': f'\n--- Page {page_num + 1} ---\n',
-                            'page_number': page_num + 1,
-                            'metadata': {'page_number': page_num + 1}
-                        })
+                    _write_fragment(stripped)
+
+                    if include_page_breaks and page_num < last:
+                        br = f"\n--- Page {page_num + 1} ---\n"
+                        elements.append(
+                            {
+                                "type": "PageBreak",
+                                "text": br,
+                                "page_number": page_num + 1,
+                                "metadata": {"page_number": page_num + 1},
+                            }
+                        )
+                        _write_fragment(br.strip())
             except Exception as e:
                 print(f"Warning: Failed to extract text from page {page_num}: {e}")
                 continue
-        
-        print(f"Successfully extracted {len(elements)} text elements from PDF")
-        return elements
-        
+
+        print(f"Successfully extracted {len(elements)} elements from PDF (page span {first}-{last})")
+        if not text_file:
+            char_count = len(extract_text_from_elements(elements))
+
+        return elements, char_count
+
+    except ValueError:
+        raise
     except Exception as e:
         print(f"Error parsing PDF with pypdf: {e}")
-        return None
+        return None, 0
+    finally:
+        if text_file:
+            text_file.close()
 
 
 # Alias for backward compatibility
@@ -167,24 +212,13 @@ def read_pdf_with_unstructured(
     pdf_path: str,
     strategy: str = "auto",
     include_page_breaks: bool = False,
-    infer_table_structure: bool = True
+    infer_table_structure: bool = True,
 ) -> Optional[List]:
-    """
-    Alias for read_pdf_with_pypdf (for backward compatibility)
-    """
-    return read_pdf_with_pypdf(pdf_path, strategy, include_page_breaks, infer_table_structure)
+    elements, _ = read_pdf_with_pypdf(pdf_path, strategy, include_page_breaks, infer_table_structure)
+    return elements
 
 
 def extract_text_from_elements(elements: List) -> str:
-    """
-    Extract text content from document elements
-    
-    Args:
-        elements: List of document elements (can be dicts from pypdf or unstructured objects)
-        
-    Returns:
-        Combined text content
-    """
     text_parts = []
     for element in elements:
         # Handle dict elements (from pypdf)
@@ -205,15 +239,7 @@ def extract_text_from_elements(elements: List) -> str:
 
 
 def analyze_elements(elements: List) -> dict:
-    """
-    Analyze and categorize document elements
-    
-    Args:
-        elements: List of document elements (can be dicts from pypdf or unstructured objects)
-        
-    Returns:
-        Dictionary with element type statistics
-    """
+
     element_stats = {}
     element_types = []
     
@@ -236,14 +262,7 @@ def analyze_elements(elements: List) -> dict:
 
 
 def save_content(content: str, output_dir: str, filename: str = "extracted_content.txt"):
-    """
-    Save extracted content to file
-    
-    Args:
-        content: Text content to save
-        output_dir: Output directory
-        filename: Output filename
-    """
+
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     
     output_path = os.path.join(output_dir, filename)
@@ -255,14 +274,7 @@ def save_content(content: str, output_dir: str, filename: str = "extracted_conte
 
 
 def save_elements_json(elements: List, output_dir: str, filename: str = "elements.json"):
-    """
-    Save elements as JSON (if supported)
-    
-    Args:
-        elements: List of document elements
-        output_dir: Output directory
-        filename: Output filename
-    """
+
     try:
         import json
         
@@ -292,7 +304,6 @@ def save_elements_json(elements: List, output_dir: str, filename: str = "element
 
 
 def main():
-    """Main function to download and read PDF from arXiv"""
     # Configuration
     # pdf_url = "https://arxiv.org/pdf/2408.09869"
     # pdf_filename = "2408.09869.pdf"
@@ -308,11 +319,11 @@ def main():
         download_pdf(pdf_url, pdf_filename)
         
         # Read PDF with pypdf
-        elements = read_pdf_with_pypdf(
+        elements, _ = read_pdf_with_pypdf(
             pdf_path=pdf_filename,
             strategy="auto",
             include_page_breaks=False,
-            infer_table_structure=True
+            infer_table_structure=True,
         )
         
         if not elements:

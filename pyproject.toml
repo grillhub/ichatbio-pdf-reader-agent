@@ -4,12 +4,12 @@ version = "1.0.0"
 requires-python = ">=3.12"
 dependencies = [
     "ichatbio-sdk~=0.2.1",
-    "openai~=1.79.0",
+    "openai>=1.109.1",
     "pydantic~=2.11.4",
-    "instructor~=1.8.2",
+    "instructor>=1.11.3",
     "dotenv~=0.9.9",
-    "pytest~=8.3.5",
-    "pytest-asyncio~=1.0.0a1",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
     "uvicorn~=0.34.3",
     "pypdf~=5.1.0",
     "requests~=2.32.0",
