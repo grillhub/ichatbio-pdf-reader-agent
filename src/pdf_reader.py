@@ -5,17 +5,24 @@ Extracts PDF URLs from text, downloads PDFs, and extracts text content
 
 import os
 import re
+import csv
 import requests
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 
-# Try to import pypdf
 try:
     from pypdf import PdfReader
     PYPDF_AVAILABLE = True
 except ImportError:
     PYPDF_AVAILABLE = False
     print("Warning: pypdf library not installed. Install with: pip install pypdf")
+
+try:
+    import fitz
+    PYMUPDF_AVAILABLE = True
+except ImportError:
+    PYMUPDF_AVAILABLE = False
+    print("Warning: PyMuPDF library not installed. Install with: pip install pymupdf")
 
 
 def extract_pdf_urls_from_text(text: str) -> List[str]:
@@ -104,6 +111,238 @@ def resolve_page_span(
             raise ValueError("max_pages must be at least 1 when set")
         end = min(end, start + cap - 1)
     return start, end
+
+
+def _safe_name(value: str, fallback: str = "pdf") -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", (value or "").strip())
+    return name[:120] if name else fallback
+
+def extract_images_with_pymupdf(
+    pdf_path: str,
+    output_dir: str,
+    source_name: str,
+    start_page: int = 1,
+    end_page: Optional[int] = None,
+    max_pages: Optional[int] = None,
+) -> Dict[str, Any]:
+    if not PYMUPDF_AVAILABLE:
+        raise ImportError(
+            "PyMuPDF library is not installed. "
+            "Please install it with: pip install pymupdf"
+        )
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+
+    safe_source = _safe_name(source_name, "pdf")
+    images_dir = Path(output_dir) / safe_source / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    image_files: List[str] = []
+    page_counts: Dict[int, int] = {}
+    total_images = 0
+
+    doc = fitz.open(pdf_path)
+    try:
+        first, last = resolve_page_span(doc.page_count, start_page, end_page, max_pages)
+        for page_num in range(first, last + 1):
+            page = doc[page_num - 1]
+            images = page.get_images(full=True)
+            if not images:
+                continue
+            page_counts[page_num] = len(images)
+            for img_idx, img in enumerate(images, start=1):
+                xref = img[0]
+                img_data = doc.extract_image(xref)
+                if not img_data:
+                    continue
+                ext = (img_data.get("ext") or "png").lower()
+                image_name = f"page_{page_num:04d}_img_{img_idx:03d}.{ext}"
+                image_path = images_dir / image_name
+                image_path.write_bytes(img_data["image"])
+                image_files.append(str(image_path))
+                total_images += 1
+    finally:
+        doc.close()
+
+    return {
+        "image_count": total_images,
+        "image_files": image_files,
+        "images_by_page": page_counts,
+        "output_dir": str(images_dir),
+    }
+
+
+def embedded_image_dimensions(path: str) -> Optional[Tuple[int, int]]:
+    """
+    Return (width, height) in pixels for a saved image file, or None if unknown.
+    PyMuPDF's page.get_images order does not match "Figure 1" vs header icons;
+    callers use dimensions to rank likely figures (large rasters) over tiny logos.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            w, h = im.size
+            if w > 0 and h > 0:
+                return (int(w), int(h))
+    except Exception:
+        pass
+    if PYMUPDF_AVAILABLE:
+        try:
+            pix = fitz.Pixmap(path)
+            try:
+                if pix.width > 0 and pix.height > 0:
+                    return (int(pix.width), int(pix.height))
+            finally:
+                del pix
+        except Exception:
+            pass
+    return None
+
+
+def rank_embedded_image_paths_for_figure_artifacts(
+    paths: List[str],
+    *,
+    min_area_px: int = 15_000,
+    min_short_side_px: int = 64,
+) -> List[str]:
+    """
+    Reorder embedded PDF image paths so large content images rank ahead of small
+    raster icons (journal marks, Scopus badges, ORCID, etc.).
+
+    PyMuPDF enumerates images in arbitrary order; filename order (img_001, img_002)
+    is not "Figure 1" vs "Figure 2". We rank by decoded pixel area (descending)
+    and drop images below size thresholds when possible.
+
+    If every image fails the threshold (unusual PDFs), falls back to all paths
+    sorted by area descending so we still prefer the largest assets.
+    """
+    if not paths:
+        return []
+
+    def passes(w: int, h: int) -> bool:
+        if w <= 0 or h <= 0:
+            return False
+        area = w * h
+        short_side = min(w, h)
+        return area >= min_area_px and short_side >= min_short_side_px
+
+    # (area, w, h, path) — one dimension read per path
+    entries: List[Tuple[int, int, int, str]] = []
+    for p in paths:
+        dim = embedded_image_dimensions(p)
+        if dim:
+            w, h = dim
+            entries.append((w * h, w, h, p))
+        else:
+            entries.append((0, 0, 0, p))
+
+    filtered = [
+        (a, p) for a, w, h, p in entries if w > 0 and h > 0 and passes(w, h)
+    ]
+    if not filtered:
+        # Nothing met the bar (e.g. all thumbnails); use largest-by-area fallback.
+        filtered = [(a, p) for a, w, h, p in entries]
+
+    filtered.sort(key=lambda t: t[0], reverse=True)
+    # Stable unique paths preserving order
+    seen: Set[str] = set()
+    out: List[str] = []
+    for _, p in filtered:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+# Caption / label cues in running text (not exhaustive; covers common publishing styles).
+_TABLE_CAPTION_LINE = re.compile(
+    r"(?im)(?:^|[\n\r])\s*(?:"
+    r"Supplementary\s+(?:Table|Tab\.?)\s*|"
+    r"Extended\s+Data\s+Table\s*|"
+    r"(?:Table|TAB\.?|Tab\.)\s*(?!of\s+contents\b)"
+    r")"
+    r"(?:[S]?\d+[A-Za-z]?|[IVXLC]+)?\s*[.:)\]]?",
+)
+
+_FIGURE_CAPTION_LINE = re.compile(
+    r"(?im)(?:^|[\n\r])\s*(?:"
+    r"Supplementary\s+(?:Figure|Fig\.?)\s*|"
+    r"(?:Figure|FIG\.?|Fig\.?|Plate|Scheme|Chart|Diagram|Graph|Map|Illustration|Image|Photo)\s*"
+    r")"
+    r"(?:[S]?\d+[A-Za-z]?|[IVXLC]+)?\s*[.:)\]]?",
+)
+
+
+def find_table_figure_cue_pages(page_texts: Dict[int, str]) -> Tuple[Set[int], Set[int]]:
+    table_pages: Set[int] = set()
+    figure_pages: Set[int] = set()
+    for page, raw in (page_texts or {}).items():
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        text = raw
+        if _TABLE_CAPTION_LINE.search(text):
+            table_pages.add(int(page))
+        if _FIGURE_CAPTION_LINE.search(text):
+            figure_pages.add(int(page))
+    return table_pages, figure_pages
+
+
+def find_pages_with_table_word(page_texts: Dict[int, str]) -> Set[int]:
+    out: Set[int] = set()
+    for page, raw in (page_texts or {}).items():
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        for m in re.finditer(r"(?i)\btable\b", raw):
+            lo, hi = m.span()
+            snippet = raw[max(0, lo - 28) : min(len(raw), hi + 36)]
+            if re.search(r"(?i)\btable\s+of\s+contents\b", snippet):
+                continue
+            out.add(int(page))
+            break
+    return out
+
+
+def read_csv_bundle_for_page(table_files: List[str], page: int) -> str:
+    needle = f"page_{page:04d}_table_"
+    paths = sorted(p for p in (table_files or []) if needle in Path(p).name)
+    parts: List[str] = []
+    for p in paths:
+        try:
+            body = Path(p).read_text(encoding="utf-8", errors="replace")
+            parts.append(f"--- {Path(p).name} ---\n{body}")
+        except OSError:
+            continue
+    return "\n\n".join(parts)
+
+
+def list_image_paths_for_page(image_files: List[str], page: int) -> List[str]:
+    needle = f"page_{page:04d}_img_"
+    return sorted(p for p in (image_files or []) if needle in Path(p).name)
+
+
+def render_pdf_page_to_png_bytes(
+    pdf_path: str,
+    page_1based: int,
+    max_side_px: int = 1200,
+) -> bytes:
+    if not PYMUPDF_AVAILABLE:
+        raise ImportError("PyMuPDF (fitz) is required for page rendering.")
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    doc = fitz.open(pdf_path)
+    try:
+        if page_1based < 1 or page_1based > doc.page_count:
+            raise ValueError(f"page_1based {page_1based} out of range 1..{doc.page_count}")
+        page = doc[page_1based - 1]
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+        w, h = pix.width, pix.height
+        if max_side_px > 0 and max(w, h) > max_side_px:
+            scale = max_side_px / float(max(w, h))
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+        return pix.tobytes("png")
+    finally:
+        doc.close()
 
 
 def read_pdf_with_pypdf(
@@ -206,8 +445,6 @@ def read_pdf_with_pypdf(
         if text_file:
             text_file.close()
 
-
-# Alias for backward compatibility
 def read_pdf_with_unstructured(
     pdf_path: str,
     strategy: str = "auto",
@@ -221,10 +458,8 @@ def read_pdf_with_unstructured(
 def extract_text_from_elements(elements: List) -> str:
     text_parts = []
     for element in elements:
-        # Handle dict elements (from pypdf)
         if isinstance(element, dict):
             text = element.get('text', '')
-        # Handle object elements (from unstructured)
         elif hasattr(element, 'text'):
             text = element.text
         elif hasattr(element, '__str__'):
@@ -244,10 +479,8 @@ def analyze_elements(elements: List) -> dict:
     element_types = []
     
     for element in elements:
-        # Handle dict elements (from pypdf)
         if isinstance(element, dict):
             element_type = element.get('type', 'Unknown')
-        # Handle object elements (from unstructured)
         else:
             element_type = type(element).__name__
         
@@ -301,81 +534,3 @@ def save_elements_json(elements: List, output_dir: str, filename: str = "element
     except Exception as e:
         print(f"Warning: Could not save JSON: {e}")
         return None
-
-
-def main():
-    # Configuration
-    # pdf_url = "https://arxiv.org/pdf/2408.09869"
-    # pdf_filename = "2408.09869.pdf"
-    pdf_url = "https://arxiv.org/pdf/2408.09869"
-    pdf_filename = "test.pdf"
-    output_dir = "./output_unstructured"
-    
-    try:
-        # Download PDF
-        print("="*80)
-        print("PDF Processing with Unstructured Library")
-        print("="*80)
-        download_pdf(pdf_url, pdf_filename)
-        
-        # Read PDF with pypdf
-        elements, _ = read_pdf_with_pypdf(
-            pdf_path=pdf_filename,
-            strategy="auto",
-            include_page_breaks=False,
-            infer_table_structure=True,
-        )
-        
-        if not elements:
-            print("Failed to extract elements from PDF")
-            return
-        
-        # Analyze elements
-        stats = analyze_elements(elements)
-        print("\n" + "="*80)
-        print("Element Analysis:")
-        print("="*80)
-        print(f"Total elements extracted: {stats['total_elements']}")
-        print("\nElement types found:")
-        for el_type, count in sorted(stats['element_types'].items()):
-            print(f"  - {el_type}: {count}")
-        
-        # Extract text content
-        print("\n" + "="*80)
-        print("Extracting text content...")
-        print("="*80)
-        text_content = extract_text_from_elements(elements)
-        
-        # Display preview
-        preview_length = 2000
-        print("\n" + "="*80)
-        print(f"Preview of extracted content (first {preview_length} characters):")
-        print("="*80)
-        print(text_content[:preview_length])
-        print("\n... (content truncated)")
-        print(f"\nTotal content length: {len(text_content)} characters")
-        
-        # Save outputs
-        print("\n" + "="*80)
-        print("Saving outputs...")
-        print("="*80)
-        save_content(text_content, output_dir, "extracted_text.txt")
-        save_elements_json(elements, output_dir, "elements.json")
-        
-        print("\n" + "="*80)
-        print("Processing complete!")
-        print("="*80)
-        print(f"Output files saved to: {output_dir}")
-        
-    except ImportError as e:
-        print(f"\nError: {e}")
-        print("\nInstallation instructions:")
-        print("  pip install pypdf")
-    except Exception as e:
-        print(f"\nError: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-if __name__ == "__main__":
-    main()

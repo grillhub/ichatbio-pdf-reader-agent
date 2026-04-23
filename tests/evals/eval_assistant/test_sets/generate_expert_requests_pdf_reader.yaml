@@ -1,0 +1,6 @@
+test_cases:
+  - artifact: Knorrn 2026.pdf
+    user_message: Please find Callista floridella identification
+    expected: >-
+      Callista floridella identification information found in the PDF that is Shell trigonal ovate in outline. Outer surface with narrow regular concentric grooves posteriorly.
+

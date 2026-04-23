@@ -1,10 +1,12 @@
-from typing import override, Optional, List, Dict
+from typing import override, Optional, List, Dict, Any, Set
 import time
 import json
 import re
 import tempfile
 import os
 import gc
+import base64
+import mimetypes
 from pathlib import Path
 
 import httpx
@@ -24,79 +26,421 @@ from .pdf_reader import (
     analyze_elements,
     get_pdf_num_pages,
     resolve_page_span,
-)
-from .pdf_reader_unstructured import (
-    read_pdf_with_unstructured as read_pdf_with_unstructured_lib,
-    extract_text_from_elements as extract_text_from_elements_unstructured,
-    analyze_elements as analyze_elements_unstructured
+    extract_images_with_pymupdf,
+    rank_embedded_image_paths_for_figure_artifacts,
+    PYMUPDF_AVAILABLE,
+    find_table_figure_cue_pages,
+    find_pages_with_table_word,
+    render_pdf_page_to_png_bytes,
+    _safe_name,
 )
 
+from .utils.tools import (
+    clean_pdf_extracted_text,
+    quote_chunk_llm_user_message_for_artifact,
+    split_page_texts_into_quote_llm_chunks,
+)
+
+
 LOCALHOST_REPLACEMENT_HOST = os.getenv("LOCALHOST_REPLACEMENT_HOST")
+
+# Environment-backed configuration (read once at import).
+PDF_TABLE_CSV_NEIGHBOR_PAGE_RADIUS = 1
+PDF_FIGURE_IMAGE_MIN_AREA = 15000
+PDF_FIGURE_IMAGE_MIN_SHORT_SIDE = 64
+PDF_FIGURE_NEIGHBOR_PAGE_RADIUS = 1
+PDF_QUOTE_CHUNK_MAX_FIGURE_IMAGES = 4
+PDF_READER_SAVED_DIR = ""
+PDF_FIGURE_ARTIFACT_MAX_PER_PAGE = 2
+PDF_TABLE_CSV_PRECOMPUTE = "1"
+PRECOMPUTE_TABLE_FIGURE_MODEL = "gpt-4o-mini"
+QUOTE_EXTRACTION_MODEL = "gpt-4o-mini"
+OPENAI_PDF_QUOTES_TIMEOUT = 120
+OPENAI_PDF_TABLE_FIGURE_TIMEOUT = 120
+PDF_TABLE_PRECOMPUTE_MAX_CALLS = 48
+PDF_TABLE_FIGURE_PAGE_TEXT_CHARS = 6000
+PDF_TABLE_FIGURE_RENDER_MAX_SIDE = 1200
+PDF_TABLE_VISION_CREATE_ARTIFACTS = "1"
+PDF_TABLE_VISION_ARTIFACT_MAX = 48
+PDF_TABLE_SAVE_PAGE_PNG = "0"
+PDF_QUOTES_MAX_PAGE_CHARS = 40000
+PDF_QUOTES_STRATEGY = "chunked"
+PDF_QUOTES_CHUNK_CHARS = 12000
+PDF_QUOTES_FULL_DOC_MAX_CHARS = 1000000
+PDF_QUOTE_FULL_DOC_MAX_FIGURE_IMAGES = 6
+PDF_SUMMARY_MAX_CHARS = 20000
 
 DESCRIPTION = """\
 This agent can read and extract information from PDF documents. It:
 - Extracts PDF URLs from user messages
 - Downloads PDF files from URLs
 - Extracts text content and structure from PDFs using advanced parsing
-- Supports optional page ranges (start_page, end_page, max_pages) for large PDFs; use pypdf for best efficiency on huge files
+- Page range: **omit `end_page` (leave unset / null) to read the whole PDF from `start_page` through the last page.** If `end_page` is set, only that span is extracted (and optional `max_pages` may tighten it further). The document may still report a larger total page count—only the requested span is processed.
 - Returns extracted information so iChatBio can answer questions about the PDF content
 
-To use this agent, simply mention a PDF URL in your message. The agent will automatically detect it, download the PDF, and extract all text content for analysis.
+To use this agent, simply mention a PDF URL in your message. The agent will automatically detect it, download the PDF, and extract text for analysis (full document unless you pass `end_page`).
 """
 
 
 class PDFReaderParams(BaseModel):
-    """Parameters for PDF reading operation"""
     pdf_url: Optional[str] = Field(
         default=None,
         description="Direct URL to a PDF file. If not provided, URLs will be extracted from the request message."
-    )
-    library: str = Field(
-        default="pypdf",
-        description="PDF reading library to use: 'pypdf' (default) or 'unstructured'. If not specified, defaults to 'pypdf'."
-    )
-    strategy: str = Field(
-        default="fast",
-        description="PDF parsing strategy. For unstructured: 'auto', 'hi_res', 'ocr_only', 'fast'. For pypdf: not used."
-    )
-    include_page_breaks: bool = Field(
-        default=False,
-        description="Whether to include page breaks in the extracted text"
-    )
-    infer_table_structure: bool = Field(
-        default=True,
-        description="Whether to infer and preserve table structure in the PDF"
     )
     pdf_artifact: Optional[Artifact] = Field(
         default=None,
         description="Artifact containing a PDF file to read instead of a URL."
     )
-    start_page: int = Field(
-        default=1,
-        ge=1,
-        description="1-based index of the first page to extract (default: 1).",
+    # is_specific_request: bool = Field(default=False)
+
+def _coerce_llm_quote_list_item(entry: Any) -> tuple[str, str] | None:
+    if isinstance(entry, str):
+        q = entry.strip()
+        return (q, "") if q else None
+    if isinstance(entry, dict):
+        raw = entry.get("text") or entry.get("verbatim") or entry.get("quote") or entry.get("quotes")
+        if not isinstance(raw, str):
+            return None
+        q = raw.strip()
+        if not q:
+            return None
+        r = entry.get("reason")
+        reason = r.strip() if isinstance(r, str) else ""
+        return (q, reason)
+    return None
+
+
+def _parse_json_object_from_response(content: str) -> dict | None:
+    if not content:
+        return None
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None
+    try:
+        obj = json.loads(content[start : end + 1])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _export_quote_finding(finding: dict) -> dict | None:
+    qt = str(finding.get("quotes", "")).strip()
+    cc = finding.get("csv_content")
+    has_cc = isinstance(cc, str) and cc.strip()
+    if not qt and not has_cc:
+        return None
+    reason = finding.get("reason")
+    rs = reason.strip() if isinstance(reason, str) else ""
+    out: dict[str, Any] = {"quotes": qt, "page": finding.get("page"), "reason": rs}
+    if has_cc:
+        out["csv_content"] = cc.strip()
+        src = finding.get("csv_content_source")
+        if isinstance(src, str) and src.strip():
+            out["csv_content_source"] = src.strip()
+    typ = finding.get("type")
+    if isinstance(typ, str) and typ.strip():
+        out["type"] = typ.strip()
+    if finding.get("figure_relevant") is True:
+        out["figure_relevant"] = True
+    return out
+
+
+_CHUNK_TABLE_RE = re.compile(r"(?i)\btable\b")
+_CHUNK_FIGURE_RE = re.compile(r"(?i)\bfigure\b")
+
+
+def _chunk_mentions_table(chunk_body: str) -> bool:
+    return bool(chunk_body and _CHUNK_TABLE_RE.search(chunk_body))
+
+
+def _chunk_mentions_figure(chunk_body: str) -> bool:
+    return bool(chunk_body and _CHUNK_FIGURE_RE.search(chunk_body))
+
+
+def _extra_table_pages_for_user_request(
+    request: str,
+    page_texts: dict[int, str],
+    span_pages: set[int],
+) -> set[int]:
+    r = (request or "").strip().lower()
+    if not r:
+        return set()
+    if "table" not in r:
+        return set()
+    extra: set[int] = set()
+    for p, raw in (page_texts or {}).items():
+        try:
+            pi = int(p)
+        except (TypeError, ValueError):
+            continue
+        if pi not in span_pages:
+            continue
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        if re.search(r"(?i)\btable\s*\d", raw):
+            extra.add(pi)
+        if re.search(r"(?i)\bresults?\b", raw) and re.search(r"(?i)\btable\b", raw):
+            extra.add(pi)
+    return extra
+
+
+def _resolve_table_csv_for_quote_page(
+    page: int,
+    page_table_csv: dict[int, str],
+    span_first: int,
+    span_last: int,
+) -> tuple[Optional[str], Optional[int]]:
+    radius = PDF_TABLE_CSV_NEIGHBOR_PAGE_RADIUS
+    order: list[int] = [0]
+    for i in range(1, radius + 1):
+        order.extend([-i, i])
+    for d in order:
+        pg = page + d
+        if pg < span_first or pg > span_last:
+            continue
+        s = page_table_csv.get(pg)
+        if isinstance(s, str) and s.strip():
+            return s.strip(), pg
+    return None, None
+
+
+def _attach_precomputed_table_csv_to_findings(
+    findings: list[dict],
+    page_table_csv: dict[int, str],
+    span_first: int,
+    span_last: int,
+) -> None:
+    if not page_table_csv:
+        return
+    for f in findings:
+        if not isinstance(f, dict):
+            continue
+        pg = f.get("page")
+        if not isinstance(pg, int):
+            continue
+        existing = f.get("csv_content")
+        if isinstance(existing, str) and existing.strip():
+            continue
+        csv_s, from_pg = _resolve_table_csv_for_quote_page(
+            pg, page_table_csv, span_first, span_last
+        )
+        if csv_s and from_pg is not None:
+            f["csv_content"] = csv_s
+            f["csv_content_source"] = (
+                f"vision_full_page_render_pdf_page_{from_pg}"
+                if from_pg == pg
+                else (
+                    f"vision_full_page_render_pdf_page_{from_pg}_"
+                    f"neighbor_of_quote_page_{pg}"
+                )
+            )
+
+
+def _image_files_grouped_by_page(image_files: list[str]) -> dict[int, list[str]]:
+    by_page: dict[int, list[str]] = {}
+    for path in image_files or []:
+        m = re.search(r"page_(\d{4})_img_", Path(path).name)
+        if not m:
+            continue
+        p = int(m.group(1))
+        by_page.setdefault(p, []).append(path)
+    for p in by_page:
+        by_page[p] = sorted(by_page[p])
+    return by_page
+
+
+def _image_files_grouped_by_page_for_figures(image_files: list[str]) -> dict[int, list[str]]:
+    raw = _image_files_grouped_by_page(image_files)
+    min_area = PDF_FIGURE_IMAGE_MIN_AREA
+    min_side = PDF_FIGURE_IMAGE_MIN_SHORT_SIDE
+    out: dict[int, list[str]] = {}
+    for page_num, paths in raw.items():
+        out[page_num] = rank_embedded_image_paths_for_figure_artifacts(
+            paths,
+            min_area_px=min_area,
+            min_short_side_px=min_side,
+        )
+    return out
+
+
+def _embedded_image_1based_page_from_filename(path: str) -> Optional[int]:
+    m = re.search(r"page_(\d{4})_img_", Path(path).name)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _collect_ranked_figure_embedded_paths(
+    images_by_page: dict[int, list[str]],
+    center_pages: list[int],
+    *,
+    span_first: int,
+    span_last: int,
+) -> list[str]:
+    radius = PDF_FIGURE_NEIGHBOR_PAGE_RADIUS
+    min_area = PDF_FIGURE_IMAGE_MIN_AREA
+    min_side = PDF_FIGURE_IMAGE_MIN_SHORT_SIDE
+
+    page_set: Set[int] = set()
+    for cp in center_pages:
+        if not isinstance(cp, int):
+            continue
+        page_set.add(cp)
+        for d in range(1, radius + 1):
+            page_set.add(cp - d)
+            page_set.add(cp + d)
+
+    clipped = {p for p in page_set if span_first <= p <= span_last}
+    merged: list[str] = []
+    seen: set[str] = set()
+    for pg in sorted(clipped):
+        for path in images_by_page.get(pg, []) or []:
+            if path not in seen:
+                seen.add(path)
+                merged.append(path)
+
+    return rank_embedded_image_paths_for_figure_artifacts(
+        merged,
+        min_area_px=min_area,
+        min_short_side_px=min_side,
     )
-    end_page: Optional[int] = Field(
-        default=None,
-        ge=1,
-        description=(
-            "1-based inclusive last page. Omit to read through the last page of the PDF "
-            "(pages start_page–N where N is the document page count), unless max_pages is set."
-        ),
-    )
-    max_pages: Optional[int] = Field(
-        default=None,
-        ge=1,
-        description="Maximum number of pages to extract starting at start_page. Useful as “first N pages” when combined with start_page=1.",
-    )
-    quotes: list[str] = Field(
-        default_factory=list,
-        description=(
-            "Specific words/phrases/quote hints to find in the PDF. "
-            "If provided, the agent asks the LLM to extract matching verbatim quotes from the document and "
-            "creates a JSON artifact with quote text and page number."
-        ),
-    )
+
+
+def _truncate_for_vision_prompt(s: str, n: int) -> str:
+    if n <= 0 or len(s) <= n:
+        return s
+    return s[:n] + "\n\n[…truncated…]"
+
+
+def _build_quote_chunk_user_content(
+    base_text: str,
+    chunk_body: str,
+    pages_in_chunk: list[int],
+    page_table_csv: dict[int, str],
+    images_by_page: dict[int, list[str]],
+    *,
+    span_first: int,
+    span_last: int,
+) -> tuple[Any, bool, bool]:
+    page_table_csv = page_table_csv or {}
+    images_by_page = images_by_page or {}
+
+    wants_table = _chunk_mentions_table(chunk_body)
+    wants_fig = _chunk_mentions_figure(chunk_body)
+
+    extra_csv: list[str] = []
+    had_table_csv = False
+    if wants_table:
+        for p in pages_in_chunk:
+            csv_s = page_table_csv.get(p)
+            if isinstance(csv_s, str) and csv_s.strip():
+                extra_csv.append(
+                    f"--- Table CSV (vision transcription of full-page render, PDF page {p}) ---\n"
+                    f"{csv_s.strip()}"
+                )
+                had_table_csv = True
+    text_body = base_text
+    if extra_csv:
+        text_body = base_text + "\n\n" + "\n\n".join(extra_csv)
+
+    max_fig = PDF_QUOTE_CHUNK_MAX_FIGURE_IMAGES
+
+    image_parts: list[dict[str, Any]] = []
+    if wants_fig:
+        ranked_paths = _collect_ranked_figure_embedded_paths(
+            images_by_page,
+            pages_in_chunk,
+            span_first=span_first,
+            span_last=span_last,
+        )
+        n_img = 0
+        for path in ranked_paths:
+            if n_img >= max_fig:
+                break
+            pt = Path(path)
+            if not pt.is_file():
+                continue
+            try:
+                raw = pt.read_bytes()
+            except OSError:
+                continue
+            if len(raw) > 8 * 1024 * 1024:
+                continue
+            mime = mimetypes.guess_type(str(pt))[0] or "image/png"
+            if not mime.startswith("image/"):
+                mime = "image/png"
+            b64 = base64.b64encode(raw).decode("ascii")
+            image_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                }
+            )
+            n_img += 1
+
+    if image_parts:
+        intro = (
+            "The block below is PDF excerpt text (and optional table CSV from a prior vision pass). "
+            "Following image(s) are embedded figures from page(s) in this excerpt; "
+            "figure captions such as \"Figure 1: …\" may appear only in the text. "
+            "Read each image and extract information relevant to the user request.\n\n"
+        )
+        return (
+            [{"type": "text", "text": intro + text_body}, *image_parts],
+            had_table_csv,
+            True,
+        )
+
+    return text_body, had_table_csv, False
+
+
+def _quote_matches_excerpt(
+    quote_clean: str,
+    chunk_body: str,
+    pages_in_chunk: list[int],
+    page_texts: dict[int, str],
+    max_chars_per_page: int,
+    page_table_csv: dict[int, str],
+    had_figure_images: bool,
+    had_table_csv: bool,
+) -> bool:
+    if quote_clean in chunk_body:
+        return True
+    if had_table_csv:
+        csv_blob = "".join(page_table_csv.get(p, "") for p in pages_in_chunk)
+        if csv_blob.strip() and quote_clean in csv_blob:
+            return True
+    for p in pages_in_chunk:
+        t = page_texts.get(p, "")
+        if max_chars_per_page > 0:
+            t = t[:max_chars_per_page]
+        if quote_clean in t:
+            return True
+    if had_figure_images and len(quote_clean.strip()) >= 28:
+        return True
+    return False
+
+
+def _finding_should_attach_figure_artifact(
+    quote_clean: str,
+    excerpt_text: str,
+    had_fig: bool,
+    had_t_csv: bool,
+    pages_in_chunk: list[int],
+    page_table_csv: dict[int, str],
+) -> bool:
+    if not had_fig:
+        return False
+    if quote_clean in excerpt_text:
+        return False
+    csv_blob = "".join(page_table_csv.get(p, "") for p in pages_in_chunk)
+    if had_t_csv and csv_blob and quote_clean in csv_blob:
+        return False
+    return True
 
 
 class PDFReaderAgent(IChatBioAgent):
@@ -132,11 +476,11 @@ class PDFReaderAgent(IChatBioAgent):
         request: str,
         params: Optional[PDFReaderParams]
     ):
-        """Handle PDF reading requests"""
         async with context.begin_process(summary="Reading and extracting information from PDF") as process:
             process: IChatBioAgentProcess
 
             await process.log(f"Params: {params}")
+            await process.log(f"Request: {request}")
 
             pdf_sources: List[Dict] = []
 
@@ -176,6 +520,34 @@ class PDFReaderAgent(IChatBioAgent):
             all_results = []
             temp_dir = None
 
+            configured_saved_dir = PDF_READER_SAVED_DIR
+            candidate_saved_dirs: list[Path] = []
+            if configured_saved_dir:
+                candidate_saved_dirs.append(Path(configured_saved_dir))
+            candidate_saved_dirs.append(Path(__file__).resolve().parent / "saved")
+            candidate_saved_dirs.append(Path(tempfile.gettempdir()) / "ichatbio_pdf_reader_saved")
+
+            saved_base_dir: Path | None = None
+            for candidate in candidate_saved_dirs:
+                try:
+                    candidate.mkdir(parents=True, exist_ok=True)
+                    probe = candidate / ".write_test"
+                    probe.write_text("ok", encoding="utf-8")
+                    probe.unlink(missing_ok=True)
+                    saved_base_dir = candidate
+                    break
+                except Exception:
+                    continue
+
+            if saved_base_dir is None:
+                await context.reply(
+                    "Error: could not find a writable directory for table/image outputs. "
+                    "Set PDF_READER_SAVED_DIR to a writable path."
+                )
+                return
+
+            await process.log(f"Using saved outputs directory: {saved_base_dir}")
+
             try:
  
                 temp_dir = tempfile.mkdtemp(prefix="pdf_reader_")
@@ -202,32 +574,49 @@ class PDFReaderAgent(IChatBioAgent):
                             downloaded_path = download_pdf(pdf_url, pdf_path)
                             await process.log("PDF downloaded successfully!")
 
-                        library = params.library if params and isinstance(params, PDFReaderParams) else "pypdf"
-                        strategy = params.strategy if params and isinstance(params, PDFReaderParams) else "fast"
-                        include_page_breaks = params.include_page_breaks if params and isinstance(params, PDFReaderParams) else False
-                        infer_table_structure = params.infer_table_structure if params and isinstance(params, PDFReaderParams) else True
-                        start_page = params.start_page if params and isinstance(params, PDFReaderParams) else 1
-                        end_page = params.end_page if params and isinstance(params, PDFReaderParams) else None
-                        max_pages = params.max_pages if params and isinstance(params, PDFReaderParams) else None
-
-                        library = library.lower().strip()
-                        if library not in ["pypdf", "unstructured"]:
-                            await process.log(f"Warning: Unknown library '{library}', defaulting to 'pypdf'")
-                            library = "pypdf"
+                        library = "pypdf"
+                        strategy = "fast"
+                        include_page_breaks = False
+                        infer_table_structure = True
+                        start_page = 1
+                        end_page = None
+                        max_pages = None
 
                         total_pdf_pages = get_pdf_num_pages(downloaded_path)
-                        end_page_effective = end_page
-                        if end_page_effective is None and max_pages is None:
-                            end_page_effective = total_pdf_pages
 
-                        max_pages_effective = max_pages
-                        if max_pages_effective is None:
-                            max_pages_effective = max(1, int(end_page_effective) - int(start_page) + 1)
+                        if end_page is None:
+                            end_page_effective = total_pdf_pages
+                            max_pages_effective: int | None = None
+                        else:
+                            end_page_effective = min(int(end_page), total_pdf_pages)
+                            max_pages_effective = max_pages
+                            if max_pages_effective is None:
+                                max_pages_effective = max(
+                                    1, int(end_page_effective) - int(start_page) + 1
+                                )
 
                         span_first, span_last = resolve_page_span(
                             total_pdf_pages, start_page, end_page_effective, max_pages_effective
                         )
-                        await process.log(f"Parsing PDF with {library} (pages {span_first}-{span_last} of {total_pdf_pages})")
+                        parse_msg = (
+                            f"Parsing PDF with {library} (pages {span_first}-{span_last} "
+                            f"of {total_pdf_pages} total)"
+                        )
+                        parse_data: dict[str, Any] = {
+                            "extract_pages_first": span_first,
+                            "extract_pages_last": span_last,
+                            "pdf_total_pages": total_pdf_pages,
+                        }
+                        if span_last < total_pdf_pages or span_first > 1:
+                            parse_msg += (
+                                ". Extraction is limited by start_page/end_page/max_pages; "
+                                "omit end_page and max_pages to process the full document (from start_page)."
+                            )
+                            parse_data["full_document_hint"] = (
+                                "Omit end_page and max_pages for full-PDF extraction; "
+                                "set start_page=1 for page 1 through last."
+                            )
+                        await process.log(parse_msg, data=parse_data)
 
                         extracted_text_path = os.path.join(
                             temp_dir, f"extracted_text_{idx + 1}.txt"
@@ -235,28 +624,16 @@ class PDFReaderAgent(IChatBioAgent):
 
                         start_time = time.perf_counter()
 
-                        if library == "unstructured":
-                            elements, text_length = read_pdf_with_unstructured_lib(
-                                pdf_path=downloaded_path,
-                                strategy=strategy,
-                                include_page_breaks=include_page_breaks,
-                                infer_table_structure=infer_table_structure,
-                                start_page=start_page,
-                                end_page=end_page_effective,
-                                max_pages=max_pages_effective,
-                                text_output_path=extracted_text_path,
-                            )
-                        else:
-                            elements, text_length = read_pdf_with_pypdf(
-                                pdf_path=downloaded_path,
-                                strategy=strategy,
-                                include_page_breaks=include_page_breaks,
-                                infer_table_structure=infer_table_structure,
-                                start_page=start_page,
-                                end_page=end_page_effective,
-                                max_pages=max_pages_effective,
-                                text_output_path=extracted_text_path,
-                            )
+                        elements, text_length = read_pdf_with_pypdf(
+                            pdf_path=downloaded_path,
+                            strategy=strategy,
+                            include_page_breaks=include_page_breaks,
+                            infer_table_structure=infer_table_structure,
+                            start_page=start_page,
+                            end_page=end_page_effective,
+                            max_pages=max_pages_effective,
+                            text_output_path=extracted_text_path,
+                        )
 
                         extraction_time = time.perf_counter() - start_time
                         await process.log(
@@ -275,11 +652,8 @@ class PDFReaderAgent(IChatBioAgent):
                                 "error": "Failed to extract elements from PDF"
                             })
                             continue
-
-                        if library == "unstructured":
-                            stats = analyze_elements_unstructured(elements)
-                        else:
-                            stats = analyze_elements(elements)
+                        
+                        stats = analyze_elements(elements)
 
                         await process.log(
                             f"Extracted {stats['total_elements']} elements and {text_length} characters of text from PDF",
@@ -289,15 +663,90 @@ class PDFReaderAgent(IChatBioAgent):
                             },
                         )
 
+                        raw_text = Path(extracted_text_path).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        refined_plain_text = clean_pdf_extracted_text(raw_text)
+                        Path(extracted_text_path).write_text(
+                            refined_plain_text, encoding="utf-8"
+                        )
+                        text_length = len(refined_plain_text)
+
                         structured_blocks = self._build_structured_blocks(elements, library)
+                        for blk in structured_blocks:
+                            if blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                                blk["text"] = clean_pdf_extracted_text(blk["text"])
+
+                        page_texts_for_vision = self._build_page_texts_from_structured_blocks(
+                            structured_blocks
+                        )
+
+                        source_label = source.get("url") or f"artifact_{idx + 1}"
+                        # a table (e.g. "Table …") are rasterized and sent to the vision LLM instead.
+                        table_extraction: Dict[str, Any] = {
+                            "table_count": 0,
+                            "table_files": [],
+                            "tables_by_page": {},
+                            "output_dir": "",
+                            "error": "",
+                        }
+                        image_extraction: Dict[str, Any] = {
+                            "image_count": 0,
+                            "image_files": [],
+                            "images_by_page": {},
+                            "output_dir": "",
+                            "error": "",
+                        }
+                        try:
+                            image_extraction = extract_images_with_pymupdf(
+                                pdf_path=downloaded_path,
+                                output_dir=str(saved_base_dir),
+                                source_name=source_label,
+                                start_page=span_first,
+                                end_page=span_last,
+                            )
+ 
+                        except Exception as img_exc:
+                            image_extraction["error"] = str(img_exc)
+                            await process.log(
+                                f"Warning: Image extraction failed for {pdf_url}: {img_exc}"
+                            )
+
+                        page_table_csv: dict[int, str] = {}
+                        if PYMUPDF_AVAILABLE and downloaded_path:
+                            try:
+                                page_table_csv = await self._precompute_page_table_csvs(
+                                    process=process,
+                                    pdf_path=downloaded_path,
+                                    page_texts=page_texts_for_vision,
+                                    span_first=span_first,
+                                    span_last=span_last,
+                                    request=request,
+                                    saved_base_dir=str(saved_base_dir)
+                                    if saved_base_dir is not None
+                                    else None,
+                                    source_label=source_label,
+                                )
+                            except Exception as pre_exc:
+                                await process.log(
+                                    f"Warning: table CSV precompute failed: {pre_exc}"
+                                )
+
+                        image_files_list = list(image_extraction.get("image_files") or [])
 
                         quote_findings: list[dict] = []
-                        if params and isinstance(params, PDFReaderParams) and params.quotes:
-                            quote_findings = await self._extract_quotes_from_structured_blocks(
-                                process=process,
-                                quote_hints=params.quotes,
-                                structured_blocks=structured_blocks,
-                            )
+                        quote_findings = await self._extract_quotes_from_structured_blocks(
+                            process=process,
+                            request=request,
+                            structured_blocks=structured_blocks,
+                            source_library=library,
+                            source_url=pdf_url,
+                            pdf_path=downloaded_path,
+                            span_first=span_first,
+                            span_last=span_last,
+                            page_table_csv=page_table_csv,
+                            image_files=image_files_list,
+                        )
 
                         result = {
                             "url": pdf_url,
@@ -307,8 +756,15 @@ class PDFReaderAgent(IChatBioAgent):
                             "element_types": stats['element_types'],
                             "text_length": text_length,
                             "strategy": strategy,
-                            # "sections_summary": sections_summary,
                             "quote_findings": quote_findings,
+                            "table_count": table_extraction.get("table_count", 0),
+                            "table_files": table_extraction.get("table_files", []),
+                            "table_output_dir": table_extraction.get("output_dir", ""),
+                            "table_error": table_extraction.get("error", ""),
+                            "image_count": image_extraction.get("image_count", 0),
+                            "image_files": image_extraction.get("image_files", []),
+                            "image_output_dir": image_extraction.get("output_dir", ""),
+                            "image_error": image_extraction.get("error", ""),
                             "total_pdf_pages": total_pdf_pages,
                             "extract_first_page": span_first,
                             "extract_last_page": span_last,
@@ -320,8 +776,9 @@ class PDFReaderAgent(IChatBioAgent):
                         if len(pdf_sources) > 1:
                             artifact_description += f" (PDF {idx + 1} of {len(pdf_sources)})"
                         artifact_description += f" (pages {span_first}-{span_last})"
+                        artifact_description += " — cleaned (line breaks normalized)"
 
-                        text_artifact_bytes = Path(extracted_text_path).read_bytes()
+                        text_artifact_bytes = refined_plain_text.encode("utf-8")
 
                         await process.create_artifact(
                             mimetype="text/plain",
@@ -338,11 +795,95 @@ class PDFReaderAgent(IChatBioAgent):
                                 "total_pdfs": len(pdf_sources),
                                 "total_pdf_pages": total_pdf_pages,
                                 "extract_first_page": span_first,
-                                "extract_last_page": span_last,
+                                "extract_last_page": span_last
                             }
                         )
 
                         text_artifact_bytes = b""
+
+                        try:
+                            qf_list = result.get("quote_findings") or []
+                            fig_pages = sorted(
+                                {
+                                    int(f["page"])
+                                    for f in qf_list
+                                    if isinstance(f, dict)
+                                    and f.get("figure_relevant") is True
+                                    and isinstance(f.get("page"), int)
+                                }
+                            )
+                            images_by_page_art = _image_files_grouped_by_page_for_figures(
+                                result.get("image_files") or []
+                            )
+                            saved_base_dir_resolved = saved_base_dir.resolve()
+                            max_fig_art = PDF_FIGURE_ARTIFACT_MAX_PER_PAGE
+                            art_i = 0
+                            for page_num in fig_pages:
+                                ranked_paths = _collect_ranked_figure_embedded_paths(
+                                    images_by_page_art,
+                                    [page_num],
+                                    span_first=span_first,
+                                    span_last=span_last,
+                                )
+                                for image_path in ranked_paths[:max_fig_art]:
+                                    p = Path(image_path)
+                                    if not p.exists() or not p.is_file():
+                                        continue
+                                    mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+                                    if not mime.startswith("image/"):
+                                        mime = "image/png"
+                                    art_i += 1
+                                    file_pg = _embedded_image_1based_page_from_filename(
+                                        str(image_path)
+                                    )
+                                    if file_pg is not None and file_pg != page_num:
+                                        fig_desc = (
+                                            f"Figure image (embedded raster PDF page {file_pg}; "
+                                            f"quote attribution page {page_num}): {p.name}"
+                                        )
+                                    else:
+                                        fig_desc = (
+                                            f"Figure image (page {page_num}, backed by quote "
+                                            f"finding): {p.name}"
+                                        )
+                                    await process.create_artifact(
+                                        mimetype=mime,
+                                        description=fig_desc,
+                                        content=p.read_bytes(),
+                                        metadata={
+                                            "source_url": pdf_url,
+                                            "image_path": str(p),
+                                            "pdf_page": page_num,
+                                            "embedded_raster_pdf_page": file_pg,
+                                            "figure_from_quote_finding": True,
+                                            "artifact_index": art_i,
+                                            "figure_selection": (
+                                                "embedded_images_neighbor_pages_ranked_by_pixel_area"
+                                            ),
+                                        },
+                                    )
+                                    try:
+                                        image_path_resolved = p.resolve()
+                                        image_path_resolved.relative_to(saved_base_dir_resolved)
+                                        image_path_resolved.unlink(missing_ok=True)
+                                    except ValueError:
+                                        await process.log(
+                                            f"Skipping image cleanup outside saved directory: {p}"
+                                        )
+                                    except Exception as cleanup_exc:
+                                        await process.log(
+                                            f"Warning: Failed to delete extracted image file {p}: {cleanup_exc}"
+                                        )
+                            if fig_pages and art_i == 0:
+                                await process.log(
+                                    "Quote findings marked figure-relevant but no image files "
+                                    "were found on disk for those page(s).",
+                                    data={"figure_pages": fig_pages},
+                                )
+                        except Exception as e:
+                            await process.log(
+                                f"Warning: Failed to create figure image artifacts for PDF {idx + 1}: {str(e)}"
+                            )
 
                         try:
                             structured_content_bytes = json.dumps(
@@ -373,9 +914,6 @@ class PDFReaderAgent(IChatBioAgent):
                                 },
                             )
                             structured_content_bytes = b""
-                            # await process.log(
-                            #     f"Created artifact with structured content blocks from PDF {idx + 1}"
-                            # )
                         except Exception as e:
                             await process.log(
                                 f"Warning: Failed to create structured blocks artifact for PDF {idx + 1}: {str(e)}"
@@ -437,8 +975,36 @@ class PDFReaderAgent(IChatBioAgent):
                             summary += "  - Inferred conclusion:\n"
                             summary += f"    {conclusion}\n"
                         quote_findings = result.get("quote_findings") or []
-                        if quote_findings:
-                            summary += f"  - Quote findings: {len(quote_findings)}\n"
+                        summary += f"  - Quote findings: {len(quote_findings)}\n"
+                        quote_payload: list[Any] = []
+                        for qf in quote_findings:
+                            if isinstance(qf, dict):
+                                ex = _export_quote_finding(qf)
+                                quote_payload.append(ex if ex is not None else qf)
+                            else:
+                                quote_payload.append(qf)
+                        summary += "  - Quote findings detail:\n"
+                        summary += (
+                            f"```json\n{json.dumps(quote_payload, ensure_ascii=False, indent=2, default=str)}\n```\n"
+                        )
+                        summary += (
+                            "  - Tables: detected from text cues (e.g. “Table …”); "
+                            "each candidate page is rendered to an image and CSV is produced by the vision model "
+                        )
+                        summary += f"  - Images extracted: {result.get('image_count', 0)}\n"
+                        if result.get("image_output_dir"):
+                            summary += f"  - Images saved to: {result.get('image_output_dir')}\n"
+                        if result.get("image_error"):
+                            summary += f"  - Image extraction warning: {result.get('image_error')}\n"
+                        image_files_for_reply = result.get("image_files", []) or []
+                        if image_files_for_reply:
+                            image_details = {
+                                "source_url": result.get("url"),
+                                "image_count": result.get("image_count", 0),
+                                "image_files": image_files_for_reply,
+                            }
+                            summary += "  - Image extraction details:\n"
+                            summary += f"```json\n{json.dumps(image_details, ensure_ascii=False, indent=2)}\n```\n"
                     else:
                         summary += f"  - Error: {result.get('error', 'Unknown error')}\n"
                     summary += "\n"
@@ -455,12 +1021,10 @@ class PDFReaderAgent(IChatBioAgent):
                 await process.log(f"Unexpected error: {str(e)}")
                 await context.reply(f"An error occurred while processing PDFs: {str(e)}")
             finally:
-                # Clean up temporary directory
                 if temp_dir and os.path.exists(temp_dir):
                     try:
                         import shutil
                         shutil.rmtree(temp_dir)
-                        # await process.log(f"Cleaned up temporary directory: {temp_dir}")
                     except Exception as e:
                         await process.log(f"Warning: Failed to clean up temporary directory: {str(e)}")
 
@@ -471,7 +1035,6 @@ class PDFReaderAgent(IChatBioAgent):
         def _get_page_number_from_metadata(meta) -> int:
             if meta is None:
                 return 1
-            # Unstructured metadata objects often expose attributes; fall back to dict-style access
             page = getattr(meta, "page_number", None)
             if page is None and isinstance(meta, dict):
                 page = meta.get("page_number")
@@ -526,7 +1089,6 @@ class PDFReaderAgent(IChatBioAgent):
                 )
                 continue
 
-            # Image or figure-like elements
             if any(key in element_type.lower() for key in ["image", "figure", "picture", "photo"]):
                 img_path = None
                 if meta is not None:
@@ -545,7 +1107,6 @@ class PDFReaderAgent(IChatBioAgent):
                 )
                 continue
 
-            # Default: treat as text-like element
             text = getattr(element, "text", None) or str(element)
             if text and text.strip():
                 structured.append(
@@ -567,7 +1128,6 @@ class PDFReaderAgent(IChatBioAgent):
 
         if os.path.exists(output_path):
             await process.log(f"PDF already exists at {output_path}, skipping download.")
-            # Try to expose at least one URL, if available
             urls = list(artifact.get_urls())
             effective_url = urls[0] if urls else None
             return output_path, effective_url
@@ -612,7 +1172,6 @@ class PDFReaderAgent(IChatBioAgent):
         ) from last_error
 
     def _expand_hint_match_context(self, page_text: str, start: int, end: int, margin: int = 400) -> str:
-        """Expand a [start:end) match span to a readable verbatim excerpt (substring of page_text)."""
         lo = max(0, start - margin)
         hi = min(len(page_text), end + margin)
         cut = page_text.rfind("\n", lo, start)
@@ -647,16 +1206,186 @@ class PDFReaderAgent(IChatBioAgent):
                 continue
         return passages
 
+    def _build_page_texts_from_structured_blocks(self, structured_blocks: list[dict]) -> dict[int, str]:
+        page_texts: dict[int, str] = {}
+        for block in structured_blocks or []:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            text = ""
+            if btype == "text":
+                text = block.get("text") or ""
+            elif btype == "table":
+                body = block.get("table_body") or ""
+                if isinstance(body, str) and body.strip():
+                    text = re.sub(r"<[^>]+>", " ", body)
+                    text = re.sub(r"\s+", " ", text).strip()
+            if not isinstance(text, str) or not text.strip():
+                continue
+            page_number = block.get("page_number") or 1
+            try:
+                page_idx = max(int(page_number), 1)
+            except (TypeError, ValueError):
+                page_idx = 1
+            previous = page_texts.get(page_idx, "")
+            page_texts[page_idx] = (previous + "\n" + text) if previous else text
+        return page_texts
+
+    async def _precompute_page_table_csvs(
+        self,
+        process: IChatBioAgentProcess,
+        pdf_path: str,
+        page_texts: dict[int, str],
+        span_first: int,
+        span_last: int,
+        request: str,
+        *,
+        saved_base_dir: str | None = None,
+        source_label: str = "pdf",
+    ) -> dict[int, str]:
+        flag = PDF_TABLE_CSV_PRECOMPUTE.strip().lower()
+        if flag in ("0", "false", "no", "off"):
+            return {}
+        if not PYMUPDF_AVAILABLE:
+            return {}
+
+        model = PRECOMPUTE_TABLE_FIGURE_MODEL
+        timeout = OPENAI_PDF_TABLE_FIGURE_TIMEOUT
+        max_calls = PDF_TABLE_PRECOMPUTE_MAX_CALLS
+        max_page_text = PDF_TABLE_FIGURE_PAGE_TEXT_CHARS
+        render_max_side = PDF_TABLE_FIGURE_RENDER_MAX_SIDE
+
+        cue_table, _cue_fig = find_table_figure_cue_pages(page_texts)
+        table_word_pages = find_pages_with_table_word(page_texts)
+        span_pages = set(range(int(span_first), int(span_last) + 1))
+        extra = _extra_table_pages_for_user_request(request, page_texts, span_pages)
+        candidate_pages = sorted((cue_table | table_word_pages | extra) & span_pages)
+
+        create_art = PDF_TABLE_VISION_CREATE_ARTIFACTS.strip().lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        )
+        art_max = PDF_TABLE_VISION_ARTIFACT_MAX
+        art_n = 0
+        save_png = PDF_TABLE_SAVE_PAGE_PNG.strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        save_dir: Path | None = None
+        if save_png and saved_base_dir:
+            save_dir = Path(saved_base_dir) / _safe_name(source_label, "pdf") / "table_vision"
+            save_dir.mkdir(parents=True, exist_ok=True)
+
+        sys_pre = (
+            "You see a full-page raster image of one PDF page (PyMuPDF) plus the same page's extracted plain text.\n"
+            "The page was chosen because its text likely refers to a table (caption or the word Table).\n"
+            "Transcribe any visible data table as CSV (comma-separated; header row when clear). "
+            "If there is no table in the image, return an empty tabular_csv string.\n"
+            "Do not invent cells; only transcribe what is visible.\n"
+            'Return ONLY JSON: {"tabular_csv": "<string>"}'
+        )
+
+        out: dict[int, str] = {}
+        calls = 0
+        client = OpenAI(timeout=timeout)
+        req_snip = (request or "").strip()[:500]
+
+        for page in candidate_pages:
+            if calls >= max_calls:
+                break
+            try:
+                png_bytes = render_pdf_page_to_png_bytes(
+                    pdf_path, page, max_side_px=render_max_side
+                )
+            except Exception as exc:
+                await process.log(f"Table CSV precompute: page render failed (page {page}): {exc}")
+                continue
+            page_text = _truncate_for_vision_prompt(page_texts.get(page, ""), max_page_text)
+            b64_png = base64.b64encode(png_bytes).decode("ascii")
+            user_block = (
+                f"(Context) User request (may be vague): {req_snip}\n\n"
+                f"Page number (1-based): {page}\n\n"
+                f"Page text:\n{page_text}\n"
+            )
+            calls += 1
+            content = ""
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": sys_pre},
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": user_block},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": f"data:image/png;base64,{b64_png}"},
+                                },
+                            ],
+                        },
+                    ],
+                    temperature=0.0,
+                )
+                content = (resp.choices[0].message.content or "").strip()
+            except Exception as exc:
+                await process.log(f"Table CSV precompute LLM error page {page}: {exc}")
+                continue
+
+            if save_dir is not None:
+                try:
+                    (save_dir / f"page_{page:04d}_render.png").write_bytes(png_bytes)
+                except OSError as exc:
+                    await process.log(f"Table CSV precompute: failed to save PNG page {page}: {exc}")
+
+            parsed = _parse_json_object_from_response(content)
+            if not isinstance(parsed, dict):
+                continue
+            tab_csv = str(parsed.get("tabular_csv") or "").strip()
+            if tab_csv:
+                out[page] = tab_csv
+
+        if out:
+            await process.log(
+                f"Table CSV precompute: stored CSV for {len(out)} page(s).",
+                data={
+                    "model": model,
+                    "vision_calls": calls,
+                    "candidate_pages": len(candidate_pages),
+                    "table_vision_artifacts_created": art_n,
+                },
+            )
+        elif calls > 0:
+            await process.log(
+                "Table CSV precompute: vision ran but no non-empty CSV returned.",
+                data={"model": model, "vision_calls": calls},
+            )
+        return out
+
     async def _extract_quotes_from_structured_blocks(
         self,
         process: IChatBioAgentProcess,
-        quote_hints: list[str],
+        request: str,
         structured_blocks: list[dict],
+        source_library: str | None = None,
+        source_url: str | None = None,
+        *,
+        pdf_path: str | None = None,
+        span_first: int | None = None,
+        span_last: int | None = None,
+        page_table_csv: dict[int, str] | None = None,
+        image_files: list[str] | None = None,
     ) -> list[dict]:
-        model_name = os.getenv("OPENAI_PDF_QUOTES_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-        await process.log(
-            f"Extracting quotes from structured document pages using model {model_name}"
-        )
+        req = (request or "").strip()
+        if not req:
+            await process.log("Quote extraction skipped: empty request.")
+            return []
+
+        model_name = QUOTE_EXTRACTION_MODEL
 
         page_texts: dict[int, str] = {}
         for block in structured_blocks or []:
@@ -685,41 +1414,83 @@ class PDFReaderAgent(IChatBioAgent):
             await process.log("No text pages available in structured_blocks for quote extraction.")
             return []
 
-        client = OpenAI()
+        span_eff_first = (
+            int(span_first) if span_first is not None else min(page_texts.keys())
+        )
+        span_eff_last = (
+            int(span_last) if span_last is not None else max(page_texts.keys())
+        )
+
+        page_table_csv = dict(page_table_csv or {})
+        images_by_page = _image_files_grouped_by_page_for_figures(
+            list(image_files or [])
+        )
+        multimodal_assets = bool(page_table_csv or images_by_page)
 
         quote_findings: list[dict] = []
+        chunked_quote_findings: list[dict] = []
         seen: set[tuple[str, int]] = set()
-        max_chars_per_page = int(os.getenv("PDF_QUOTES_MAX_PAGE_CHARS", "40000"))
-        hints_norm = {h.strip().lower() for h in (quote_hints or []) if h and h.strip()}
+        max_chars_per_page = PDF_QUOTES_MAX_PAGE_CHARS
 
         usage_prompt_tokens = 0
         usage_completion_tokens = 0
         usage_total_tokens = 0
         llm_request_count = 0
 
-        compare_full_doc = True
+        _raw_strategy = PDF_QUOTES_STRATEGY
+        strategy = _raw_strategy.strip().lower()
+        quote_timeout = OPENAI_PDF_QUOTES_TIMEOUT
+        client = OpenAI(timeout=quote_timeout)
 
         system_message = (
-            "Extract quotes from this document. "
-            "The user may supply hints that are keywords, short phrases, or questions. "
-            "Those hints might not appear word-for-word on the page; still return one or more passages "
-            "that are clearly relevant (same topic, answer the implied question, or support what the hints ask about). "
-            "Each returned string must be copied EXACTLY from the page text (contiguous substring): "
-            "prefer a full sentence ending in . ! or ? when the page has normal punctuation; "
-            "if the page uses headings, bullets, or technical lines without a period, return one or more "
-            "contiguous verbatim lines or list items (at least ~40 characters when possible) instead. "
-            "Do not paraphrase, summarize, or fix spelling. "
-            'Return ONLY a JSON object: {"quotes": ["..."]}. '
-            "If nothing on this page is relevant, return {\"quotes\": []}."
+            "You receive one user request string and document text (often with page markers). "
+            "Decide if it asks for particular information, evidence, or passages (topic, question, keywords, "
+            "'find / quote / what does it say'). "
+            "If the request is ONLY a vague instruction to read or open the document with no target "
+            "(e.g. 'read', 'open the PDF'), return {\"quotes\": []} only—do not invent filler quotes. "
+            "If the request is specific, extract verbatim passages that truly satisfy it. "
+            "STRUCTURE AND DISAMBIGUATION (critical): PDFs use many layouts—taxonomic catalogs, numbered sections, "
+            "repeated labels like 'Identification.', 'Records.', 'Methods', tables, figure captions. "
+            "When the user names an entity (species, drug, gene, product, section title, figure, table row), "
+            "you must anchor quotes to THAT entity's block: read nearby lines before and after. "
+            "The answer often sits immediately under the heading or name line that matches the request "
+            "(same paragraph block or the next few lines), not under a different heading that merely shares the same label. "
+            "Never return a passage from another organism, product, or section just because it contains a generic word "
+            "(e.g. another 'Identification.' for a different species). "
+            "Prefer a single contiguous quote that includes the anchor line (e.g. the scientific name / heading) "
+            "plus the following description when that makes which entry you mean obvious—still exact substring from the text. "
+            "If you cannot find text clearly tied to the requested entity/topic in this excerpt, return {\"quotes\": []}. "
+            "Do not merge facts from unrelated entries; your reason must truthfully state how the quoted lines connect "
+            "to the anchor (e.g. 'Follows the line naming Callista floridella'). "
+            "Each verbatim passage must be copied EXACTLY from the provided text (contiguous substring): "
+            "prefer full sentences when punctuation is normal; otherwise contiguous lines or list items "
+            "(at least ~40 characters when possible). Do not paraphrase or fix spelling. "
+            "For every quote, give a short \"reason\" tying the passage to the user's request and to the local structure. "
+            'Return ONLY a JSON object. Preferred shape: {"quotes": [{"text": "<verbatim from page>", "reason": "..."}]}. '
+            'Legacy strings are still accepted: {"quotes": ["<verbatim>", ...]}. '
+            "If nothing in this excerpt matches the request with a clear structural anchor, return {\"quotes\": []}."
         )
+        if multimodal_assets:
+            system_message += (
+                " The excerpt may additionally include table CSV (machine-transcribed from full-page images) "
+                "and/or embedded figure images for pages in range; use them together with the text to answer. "
+                "When the excerpt contains the word Figure, image(s) may follow the text—read them for facts "
+                "relevant to the user request. When it contains Table, CSV lines may follow—quote exact CSV "
+                "substrings if they answer the request."
+            )
         user_message_prefix = (
-            f"Hints (topics or queries; they need not literally appear on the page):\n"
-            f"{json.dumps(quote_hints, ensure_ascii=False)}\n\n"
-            "Return full sentence(s) from the page text that best address these hints. "
-            "Bad (too short / not full sentences): "
+            "User request (full string; may be a specific question/topic or a vague instruction):\n"
+            f"{req}\n\n"
+            "Use the visible structure of THIS excerpt (headings, taxon names, 'Identification.', captions, page breaks). "
+            "Quote the passage that belongs to the entry the request asks about—not a different entry that shares a similar label. "
+            "When the request names a taxon or term, include the name line in the quote if it appears adjacent in the text "
+            "so the quote is self-explanatory. "
+            "If this request is vague (read/open only), return {\"quotes\": []}. "
+            "Bad (too short / wrong entry): "
             '{"quotes": ["method", "outcome"]}\n'
-            "Good (verbatim full sentence(s) from the page): "
-            '{"quotes": ["We compared treatment A and treatment B using a randomized controlled design."]}\n\n'
+            "Good (anchored verbatim block + reason naming the anchor): "
+            '{"quotes": [{"text": "Species X (Author, 1900) Fig. 1. Identification. Shell oval with …", '
+            '"reason": "Species X is named on the preceding line; this Identification block describes that species as requested."}]}\n\n'
         )
 
         try:
@@ -731,396 +1502,209 @@ class PDFReaderAgent(IChatBioAgent):
                 if not page_text.strip():
                     continue
 
-                user_message = (
+                base_u = (
                     user_message_prefix
                     + f"Page number: {page}\n\n"
                     + f"Page text:\n{page_text}"
                 )
-
-                # await process.log(f"System message: {system_message}")
-                # await process.log(f"User message: {user_message}")
-
-                response = client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": system_message},
-                        {"role": "user", "content": user_message},
-                    ],
-                    temperature=0.0,
+                user_content, had_t_csv, had_fig = _build_quote_chunk_user_content(
+                    base_u,
+                    page_text,
+                    [page],
+                    page_table_csv,
+                    images_by_page,
+                    span_first=span_eff_first,
+                    span_last=span_eff_last,
                 )
-                llm_request_count += 1
-                usage = getattr(response, "usage", None)
-                if usage is not None:
-                    pt = getattr(usage, "prompt_tokens", 0)
-                    ct = getattr(usage, "completion_tokens", 0)
-                    tt = getattr(usage, "total_tokens", 0)
-                    usage_prompt_tokens += int(pt)
-                    usage_completion_tokens += int(ct)
-                    if tt is not None:
-                        usage_total_tokens += int(tt)
-                    else:
-                        usage_total_tokens += int(pt) + int(ct)
 
-                content = response.choices[0].message.content or ""
-
-                json_start = content.find("{")
-                json_end = content.rfind("}")
-                if json_start == -1 or json_end == -1 or json_end < json_start:
-                    await process.log(
-                        f"Quote extraction: no JSON object in LLM response for page {page}.",
-                        data={"page": page, "preview": content[:500]},
-                    )
-                else:
-                    try:
-                        parsed = json.loads(content[json_start : json_end + 1])
-                    except json.JSONDecodeError as exc:
-                        await process.log(
-                            f"Quote extraction: JSON parse failed on page {page}: {exc}",
-                            data={"page": page, "preview": content[:500]},
-                        )
-                        parsed = None
-                    if parsed is not None:
-                        candidate_quotes = parsed.get("quotes", [])
-                        if not isinstance(candidate_quotes, list):
-                            await process.log(
-                                f'Quote extraction: expected "quotes" list on page {page}.',
-                                data={"page": page},
-                            )
-                        else:
-                            rejected_not_substring = 0
-                            for quote in candidate_quotes:
-                                if not isinstance(quote, str):
-                                    continue
-                                quote_clean = quote.strip()
-                                if not quote_clean:
-                                    continue
-                                if quote_clean not in page_text:
-                                    rejected_not_substring += 1
-                                    continue
-                                if (
-                                    quote_clean.lower() in hints_norm
-                                    and not re.search(r"[.!?]", quote_clean)
-                                ):
-                                    continue
-
-                                key = (quote_clean, page)
-                                if key in seen:
-                                    continue
-                                seen.add(key)
-                                quote_findings.append({"quotes": quote_clean, "page": page})
-
-                for passage in self._verbatim_passages_for_hints(page_text, quote_hints):
+                for passage in self._verbatim_passages_for_hints(page_text, [req]):
                     key = (passage, page)
                     if key in seen:
                         continue
                     seen.add(key)
-                    quote_findings.append({"quotes": passage, "page": page})
+                    quote_findings.append({"quotes": passage, "page": page, "reason": ""})
 
             per_page_wall_seconds = time.perf_counter() - per_page_wall_start
 
-            if compare_full_doc:
-                full_doc_max_chars = 1000000
-                full_prompt_tokens = 0
-                full_completion_tokens = 0
-                full_total_tokens = 0
-                full_doc_wall_seconds: float | None = None
-                single_request_quote_findings: list[dict] = []
+            if strategy == "chunked":
+                chunk_size = PDF_QUOTES_CHUNK_CHARS
+                llm_chunks = split_page_texts_into_quote_llm_chunks(
+                    page_texts, max_chars_per_page, chunk_size
+                )
 
-                page_blocks: list[str] = []
-                for p in sorted(page_texts.keys()):
-                    pt = page_texts[p]
-                    if max_chars_per_page > 0:
-                        pt = pt[:max_chars_per_page]
-                    if not pt.strip():
+                t_chunked = time.perf_counter()
+                for ch_i, ch in enumerate(llm_chunks):
+                    chunk_body = ch.get("text") or ""
+                    pages_in_chunk = ch.get("pages") or []
+                    if not chunk_body.strip():
                         continue
-                    page_blocks.append(f"Page number: {p}\n\nPage text:\n{pt}")
-                user_message_full = user_message_prefix + "\n\n".join(page_blocks)
-                if full_doc_max_chars > 0 and len(user_message_full) > full_doc_max_chars:
-                    user_message_full = user_message_full[:full_doc_max_chars]
-                    await process.log(
-                        "Quote extraction benchmark: truncated combined user message "
-                        f"to {full_doc_max_chars} chars (PDF_QUOTES_FULL_DOC_MAX_CHARS).",
-                        data={"max_chars": full_doc_max_chars},
+                    base_chunk = user_message_prefix + chunk_body
+                    user_content, had_t_csv, had_fig = _build_quote_chunk_user_content(
+                        base_chunk,
+                        chunk_body,
+                        pages_in_chunk,
+                        page_table_csv,
+                        images_by_page,
+                        span_first=span_eff_first,
+                        span_last=span_eff_last,
                     )
-
-                # await process.log(f"Full System message: {system_message}")
-                # await process.log(f"Full User message: {user_message_full}")
-
-                if user_message_full.strip() and page_blocks:
-                    t_full_start = time.perf_counter()
                     try:
-                        response_full = client.chat.completions.create(
+                        resp_c = client.chat.completions.create(
                             model=model_name,
                             messages=[
                                 {"role": "system", "content": system_message},
-                                {"role": "user", "content": user_message_full},
+                                {"role": "user", "content": user_content},
                             ],
                             temperature=0.0,
                         )
-                        full_doc_wall_seconds = time.perf_counter() - t_full_start
-                        usage_f = getattr(response_full, "usage", None)
-                        if usage_f is not None:
-                            pt = getattr(usage_f, "prompt_tokens", 0)
-                            ct = getattr(usage_f, "completion_tokens", 0)
-                            tt = getattr(usage_f, "total_tokens", 0)
-                            full_prompt_tokens += int(pt)
-                            full_completion_tokens += int(ct)
+                        llm_request_count += 1
+                        usage_c = getattr(resp_c, "usage", None)
+                        if usage_c is not None:
+                            pt = getattr(usage_c, "prompt_tokens", 0)
+                            ct = getattr(usage_c, "completion_tokens", 0)
+                            tt = getattr(usage_c, "total_tokens", 0)
+                            usage_prompt_tokens += int(pt)
+                            usage_completion_tokens += int(ct)
                             if tt is not None:
-                                full_total_tokens += int(tt)
+                                usage_total_tokens += int(tt)
                             else:
-                                full_total_tokens += int(pt) + int(ct)
-
-                        content_f = response_full.choices[0].message.content or ""
-                        js = content_f.find("{")
-                        je = content_f.rfind("}")
-                        if js != -1 and je != -1 and je >= js:
+                                usage_total_tokens += int(pt) + int(ct)
+                        content_c = resp_c.choices[0].message.content or ""
+                        j0 = content_c.find("{")
+                        j1 = content_c.rfind("}")
+                        if j0 != -1 and j1 != -1 and j1 >= j0:
                             try:
-                                parsed_f = json.loads(content_f[js : je + 1])
+                                parsed_c = json.loads(content_c[j0 : j1 + 1])
                             except json.JSONDecodeError:
-                                parsed_f = None
-                            if isinstance(parsed_f, dict):
-                                raw_quotes = parsed_f.get("quotes", [])
-                                if isinstance(raw_quotes, list):
-                                    seen_single: set[tuple[str, int]] = set()
-                                    for quote in raw_quotes:
-                                        if not isinstance(quote, str):
+                                parsed_c = None
+                            if isinstance(parsed_c, dict):
+                                raw_q = parsed_c.get("quotes", [])
+                                if isinstance(raw_q, list):
+                                    for quote in raw_q:
+                                        coerced = _coerce_llm_quote_list_item(quote)
+                                        if coerced is None:
                                             continue
-                                        quote_clean = quote.strip()
+                                        quote_clean, quote_reason = coerced
                                         if not quote_clean:
                                             continue
-                                        for p in sorted(page_texts.keys()):
-                                            ptext = page_texts[p]
+                                        if not _quote_matches_excerpt(
+                                            quote_clean,
+                                            chunk_body,
+                                            pages_in_chunk,
+                                            page_texts,
+                                            max_chars_per_page,
+                                            page_table_csv,
+                                            had_fig,
+                                            had_t_csv,
+                                        ):
+                                            continue
+                                        resolved_page: int | None = None
+                                        for p in pages_in_chunk:
+                                            ptext = page_texts.get(p, "")
                                             if max_chars_per_page > 0:
                                                 ptext = ptext[:max_chars_per_page]
-                                            if quote_clean not in ptext:
+                                            if quote_clean in ptext:
+                                                resolved_page = p
+                                                break
+                                        if resolved_page is None:
+                                            for p in sorted(page_texts.keys()):
+                                                ptext = page_texts[p]
+                                                if max_chars_per_page > 0:
+                                                    ptext = ptext[:max_chars_per_page]
+                                                if quote_clean in ptext:
+                                                    resolved_page = p
+                                                    break
+                                        if resolved_page is None:
+                                            if pages_in_chunk:
+                                                resolved_page = pages_in_chunk[0]
+                                            elif page_texts:
+                                                resolved_page = min(page_texts.keys())
+                                            else:
                                                 continue
-                                            if (
-                                                quote_clean.lower() in hints_norm
-                                                and not re.search(r"[.!?]", quote_clean)
-                                            ):
-                                                break
-                                            key = (quote_clean, p)
-                                            if key in seen_single:
-                                                break
-                                            seen_single.add(key)
-                                            single_request_quote_findings.append(
-                                                {"quotes": quote_clean, "page": p}
-                                            )
-                                            break
-                    except Exception as bench_exc:
+                                        ck = (quote_clean, resolved_page)
+                                        if ck in seen:
+                                            continue
+                                        seen.add(ck)
+                                        row_c: dict[str, Any] = {
+                                            "quotes": quote_clean,
+                                            "page": resolved_page,
+                                            "reason": quote_reason,
+                                        }
+                                        if _finding_should_attach_figure_artifact(
+                                            quote_clean,
+                                            chunk_body,
+                                            had_fig,
+                                            had_t_csv,
+                                            pages_in_chunk,
+                                            page_table_csv,
+                                        ):
+                                            row_c["figure_relevant"] = True
+                                        quote_findings.append(row_c)
+                    except Exception as chunk_exc:
                         await process.log(
-                            f"Quote extraction benchmark (full document) failed: {bench_exc}",
+                            f"Quote extraction (chunked strategy) failed on chunk "
+                            f"{ch_i + 1}/{len(llm_chunks)}: {chunk_exc}",
                             data={"model": model_name},
                         )
-
+                chunked_wall = time.perf_counter() - t_chunked
                 await process.log(
-                    "Quote extraction: each page vs one request for all pages",
+                    "Quote extraction (chunked strategy) complete",
                     data={
-                        "pages_scanned": len(page_texts),
                         "model": model_name,
-                        "per_page_requests": {
-                            "time_usage_seconds": round(per_page_wall_seconds, 4),
-                            "quotes_found_count": len(quote_findings),
-                            "prompt_tokens_total": usage_prompt_tokens,
-                            "completion_tokens_total": usage_completion_tokens,
-                            "tokens_total": usage_total_tokens,
-                        },
-                        "single_request_all_pages": {
-                            "time_usage_seconds": (
-                                round(full_doc_wall_seconds, 4)
-                                if full_doc_wall_seconds is not None
-                                else 0.0
-                            ),
-                            "quotes_found_count": len(single_request_quote_findings),
-                            "prompt_tokens_total": full_prompt_tokens,
-                            "completion_tokens_total": full_completion_tokens,
-                            "tokens_total": full_total_tokens,
-                        },
+                        "llm_requests": llm_request_count,
+                        "chunk_count": len(llm_chunks),
+                        "wall_seconds_chunked_llm": round(chunked_wall, 4),
+                        "quotes_found_count": len(quote_findings),
                     },
                 )
 
-                if quote_findings:
-                    await process.log(
-                        "Quote extraction findings (per-page).",
-                        data={
-                            "model": model_name,
-                            "pages_scanned": len(page_texts),
-                            "quote_count": len(quote_findings),
-                            "quote_findings": quote_findings,
-                        },
-                    )
-                    try:
-                        cleaned_findings: list[dict] = []
-                        for finding in quote_findings:
-                            quote_text = str(finding.get("quotes", "")).strip()
-                            quote_page = finding.get("page", None)
-                            if not quote_text:
-                                continue
-                            cleaned_findings.append({"quotes": quote_text, "page": quote_page})
+            _attach_precomputed_table_csv_to_findings(
+                quote_findings,
+                page_table_csv,
+                span_eff_first,
+                span_eff_last,
+            )
 
-                        if cleaned_findings:
-                            content = json.dumps(
-                                {"quote_findings": cleaned_findings},
-                                ensure_ascii=False,
-                                indent=2,
-                            )
-                            await process.create_artifact(
-                                mimetype="application/json",
-                                description=f"Quote findings (per-page) [{len(cleaned_findings)} quotes]",
-                                content=(content + "\n").encode("utf-8"),
-                                metadata={
-                                    "quote_findings": cleaned_findings,
-                                },
-                            )
-                    except Exception as art_exc:
-                        await process.log(
-                            f"Warning: Failed to create aggregated per-page quote findings artifact: {art_exc}",
-                            data={"model": model_name},
+            if quote_findings:
+                try:
+                    cleaned: list[dict] = []
+                    for finding in quote_findings:
+                        exp = _export_quote_finding(finding)
+                        if exp:
+                            cleaned.append(exp)
+                    if cleaned:
+                        body = json.dumps(
+                            {"quote_findings": cleaned},
+                            ensure_ascii=False,
+                            indent=2,
                         )
-
-                if single_request_quote_findings:
-                    await process.log(
-                        "Quote extraction findings (single request over all pages).",
-                        data={
-                            "model": model_name,
-                            "pages_scanned": len(page_texts),
-                            "quote_count": len(single_request_quote_findings),
-                            "single_request_quote_findings": single_request_quote_findings,
-                        },
-                    )
-                    try:
-                        cleaned_findings: list[dict] = []
-                        for finding in single_request_quote_findings:
-                            quote_text = str(finding.get("quotes", "")).strip()
-                            quote_page = finding.get("page", None)
-                            if not quote_text:
-                                continue
-                            cleaned_findings.append({"quotes": quote_text, "page": quote_page})
-
-                        if cleaned_findings:
-                            content = json.dumps(
-                                {"quote_findings": cleaned_findings},
-                                ensure_ascii=False,
-                                indent=2,
-                            )
-                            await process.create_artifact(
-                                mimetype="application/json",
-                                description=(
-                                    "Quote findings (single request over all pages) "
-                                    f"[{len(cleaned_findings)} quotes]"
-                                ),
-                                content=(content + "\n").encode("utf-8"),
-                                metadata={
-                                    "quote_findings": cleaned_findings,
-                                },
-                            )
-                    except Exception as art_exc:
-                        await process.log(
-                            "Warning: Failed to create aggregated single-request quote findings artifact: "
-                            f"{art_exc}",
-                            data={"model": model_name},
+                        await process.create_artifact(
+                            mimetype="application/json",
+                            description=(
+                                f"Quote findings ({strategy} strategy) [{len(cleaned)} quotes]"
+                            ),
+                            content=(body + "\n").encode("utf-8"),
+                            metadata={
+                                "quote_findings": cleaned,
+                                "quote_extraction_strategy": strategy,
+                            },
                         )
+                except Exception as art_exc:
+                    await process.log(
+                        f"Warning: Failed to create quote findings artifact ({strategy}): {art_exc}",
+                        data={"model": model_name},
+                    )
 
             if llm_request_count <= 0:
                 await process.log(
                     "Quote extraction: no LLM requests recorded (no pages with text to scan).",
                     data={"model": model_name},
                 )
-            
+
             return quote_findings
         except Exception as e:
             await process.log(f"Warning: Quote extraction failed: {str(e)}", data={"model": model_name})
             return []
-
-    async def _summarize_pdf_with_llm(
-        self,
-        process: IChatBioAgentProcess,
-        pdf_url: str | None = None,
-        text_source_path: str | None = None,
-        text_content: str | None = None,
-    ) -> Dict[str, str]:
-        await process.log("Summarizing PDF content (title/abstract/methods/conclusion)...")
-
-        max_chars = int(os.getenv("PDF_SUMMARY_MAX_CHARS", "20000"))
-        snippet = ""
-        if text_source_path and os.path.isfile(text_source_path):
-            with open(text_source_path, "r", encoding="utf-8", errors="replace") as tf:
-                snippet = tf.read(max_chars)
-        elif text_content is not None:
-            snippet = text_content[:max_chars]
-
-        system_message = (
-            "You are an assistant that reads scientific or technical PDF text and "
-            "extracts four key sections: Title, Abstract, Methods, and Conclusion. "
-            "Always answer in strict JSON with keys: "
-            '\"title\", \"abstract\", \"methods\", \"conclusion\". '
-            "If some information is not present, use an empty string for that field."
-        )
-
-        user_message = (
-            "Read the following PDF content and provide a concise scientific summary "
-            "with the following fields:\n"
-            "- Title: the main title of the work\n"
-            "- Abstract: a short overview of the problem, approach, and key results\n"
-            "- Methods: the main methodology, models, or experimental setup\n"
-            "- Conclusion: the main findings, implications, or takeaways\n\n"
-            "Return ONLY a JSON object, no extra text, in this form:\n"
-            "{\n"
-            '  \"title\": \"...\",\n'
-            '  \"abstract\": \"...\",\n'
-            '  \"methods\": \"...\",\n'
-            '  \"conclusion\": \"...\"\n'
-            "}\n\n"
-            "Here is the PDF content:\n\n"
-            f"{snippet}"
-        )
-
-        client = OpenAI()
-        model_name = os.getenv("OPENAI_PDF_SUMMARY_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-
-        try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": system_message},
-                    {"role": "user", "content": user_message},
-                ],
-                temperature=0.2,
-            )
-            content = response.choices[0].message.content or ""
-
-            json_start = content.find("{")
-            json_end = content.rfind("}")
-            if json_start != -1 and json_end != -1 and json_end >= json_start:
-                content = content[json_start : json_end + 1]
-
-            parsed = json.loads(content)
-
-            summary: Dict[str, str] = {
-                "title": str(parsed.get("title", "")).strip(),
-                "abstract": str(parsed.get("abstract", "")).strip(),
-                "methods": str(parsed.get("methods", "")).strip(),
-                "conclusion": str(parsed.get("conclusion", "")).strip(),
-            }
-
-            await process.log(
-                "PDF content summarization complete.",
-                data={"model": model_name},
-            )
-            return summary
-
-        except Exception as e:
-            await process.log(
-                f"Warning: LLM summarization failed, falling back to empty summary: {str(e)}",
-                data={"pdf_url": pdf_url, "model": model_name},
-            )
-            return {
-                "title": "",
-                "abstract": "",
-                "methods": "",
-                "conclusion": "",
-            }
-
 
 def create_app() -> Starlette:
     agent = PDFReaderAgent()
