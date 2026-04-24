@@ -6,6 +6,8 @@ Extracts PDF URLs from text, downloads PDFs, and extracts text content
 import os
 import re
 import csv
+import json
+import io
 import requests
 from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple, Set
@@ -23,6 +25,15 @@ try:
 except ImportError:
     PYMUPDF_AVAILABLE = False
     print("Warning: PyMuPDF library not installed. Install with: pip install pymupdf")
+
+try:
+    import pymupdf4llm
+    PYMUPDF4LLM_AVAILABLE = True
+except ImportError:
+    PYMUPDF4LLM_AVAILABLE = False
+    print(
+        "Warning: pymupdf4llm library not installed. Install with: pip install pymupdf4llm"
+    )
 
 
 def extract_pdf_urls_from_text(text: str) -> List[str]:
@@ -444,6 +455,181 @@ def read_pdf_with_pypdf(
     finally:
         if text_file:
             text_file.close()
+
+
+def _rows_to_csv_string(rows: Any) -> str:
+    if not isinstance(rows, list) or not rows:
+        return ""
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    wrote_any = False
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        writer.writerow(["" if cell is None else str(cell) for cell in row])
+        wrote_any = True
+    return buf.getvalue().strip() if wrote_any else ""
+
+
+def read_pdf_with_pymupdf4llm_json(
+    pdf_path: str,
+    start_page: int = 1,
+    end_page: Optional[int] = None,
+    max_pages: Optional[int] = None
+) -> Tuple[Optional[List[Dict[str, Any]]], int, Dict[int, str], Dict[int, List[Dict[str, str]]]]:
+    if not PYMUPDF4LLM_AVAILABLE:
+        raise ImportError(
+            "pymupdf4llm library is not installed. "
+            "Please install it with: pip install pymupdf4llm"
+        )
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+
+    print(f"Parsing PDF with pymupdf4llm: {pdf_path}")
+    try:
+        jsondata = pymupdf4llm.to_json(str(pdf_path), embed_images=True)
+        if isinstance(jsondata, str):
+            parsed = json.loads(jsondata)
+        else:
+            parsed = jsondata
+    except Exception as e:
+        print(f"Error parsing PDF with pymupdf4llm: {e}")
+        return None, 0, {}, {}
+
+    if not isinstance(parsed, dict):
+        print("Error parsing PDF with pymupdf4llm: JSON root is not an object")
+        return None, 0, {}, {}
+
+    pages = parsed.get("pages") or []
+    if not isinstance(pages, list):
+        print("Error parsing PDF with pymupdf4llm: pages is not a list")
+        return None, 0, {}, {}
+
+    num_pages = len(pages)
+    if num_pages < 1:
+        return [], 0, {}, {}
+    first, last = resolve_page_span(num_pages, start_page, end_page, max_pages)
+
+    elements: List[Dict[str, Any]] = []
+    page_table_csv: Dict[int, str] = {}
+    page_embedded_images: Dict[int, List[Dict[str, str]]] = {}
+    page_text_fragments: List[str] = []
+
+    for page_number in range(first, last + 1):
+        page_obj = pages[page_number - 1]
+        if not isinstance(page_obj, dict):
+            continue
+        boxes = page_obj.get("boxes") or []
+        if not isinstance(boxes, list):
+            continue
+
+        text_parts_on_page: List[str] = []
+        table_index_on_page = 0
+
+        for box in boxes:
+            if not isinstance(box, dict):
+                continue
+            boxclass = str(box.get("boxclass") or "").strip().lower()
+            if boxclass == "table":
+                table_obj = box.get("table") or {}
+                if not isinstance(table_obj, dict):
+                    table_obj = {}
+                extract_rows = table_obj.get("extract")
+                markdown = table_obj.get("markdown")
+                table_csv = _rows_to_csv_string(extract_rows)
+                table_index_on_page += 1
+                if table_csv:
+                    existing = page_table_csv.get(page_number, "")
+                    sep = "\n\n" if existing else ""
+                    page_table_csv[page_number] = (
+                        f"{existing}{sep}# Table {table_index_on_page} (page {page_number})\n{table_csv}"
+                    )
+                table_text = ""
+                if isinstance(markdown, str) and markdown.strip():
+                    table_text = markdown.strip()
+                elif table_csv:
+                    table_text = table_csv
+                if table_text:
+                    elements.append(
+                        {
+                            "type": "Table",
+                            "text": table_text,
+                            "table_csv": table_csv,
+                            "page_number": page_number,
+                            "metadata": {"page_number": page_number},
+                        }
+                    )
+                continue
+
+            if boxclass in ("picture", "image", "figure", "photo"):
+                image_blob = box.get("image")
+                if isinstance(image_blob, str) and image_blob.strip():
+                    raw = image_blob.strip()
+                    mime = "image/png"
+                    b64 = raw
+                    if raw.startswith("data:"):
+                        header, _, payload = raw.partition(",")
+                        if payload:
+                            b64 = payload
+                        if ";" in header and ":" in header:
+                            try:
+                                mime = header.split(":", 1)[1].split(";", 1)[0] or mime
+                            except Exception:
+                                mime = "image/png"
+                    item = {"base64": b64, "mime": mime}
+                    page_embedded_images.setdefault(page_number, []).append(item)
+                    elements.append(
+                        {
+                            "type": "Image",
+                            "text": "",
+                            "page_number": page_number,
+                            "image_base64": b64,
+                            "image_mime": mime,
+                            "metadata": {"page_number": page_number},
+                        }
+                    )
+                continue
+
+            textlines = box.get("textlines") or []
+            if not isinstance(textlines, list):
+                continue
+            line_parts: List[str] = []
+            for textline in textlines:
+                if not isinstance(textline, dict):
+                    continue
+                spans = textline.get("spans") or []
+                if not isinstance(spans, list):
+                    continue
+                span_text = "".join(
+                    str(span.get("text") or "")
+                    for span in spans
+                    if isinstance(span, dict)
+                )
+                if span_text.strip():
+                    line_parts.append(span_text)
+            if line_parts:
+                text_parts_on_page.append("\n".join(line_parts).strip())
+
+        page_text = "\n\n".join(part for part in text_parts_on_page if part).strip()
+        if page_text:
+            elements.append(
+                {
+                    "type": "Text",
+                    "text": page_text,
+                    "page_number": page_number,
+                    "metadata": {
+                        "page_number": page_number,
+                        "total_pages": num_pages,
+                        "extract_first_page": first,
+                        "extract_last_page": last,
+                    },
+                }
+            )
+            page_text_fragments.append(page_text)
+
+    full_text = "\n\n".join(page_text_fragments).strip()
+
+    return elements, len(full_text), page_table_csv, page_embedded_images
 
 def read_pdf_with_unstructured(
     pdf_path: str,
