@@ -6,7 +6,6 @@ import tempfile
 import os
 import gc
 import base64
-import mimetypes
 from pathlib import Path
 
 import httpx
@@ -22,12 +21,10 @@ from openai import OpenAI
 from .pdf_reader import (
     extract_pdf_urls_from_text,
     download_pdf,
-    read_pdf_with_pypdf,
+    read_pdf_with_pymupdf4llm_json,
     analyze_elements,
     get_pdf_num_pages,
     resolve_page_span,
-    extract_images_with_pymupdf,
-    rank_embedded_image_paths_for_figure_artifacts,
     PYMUPDF_AVAILABLE,
     find_table_figure_cue_pages,
     find_pages_with_table_word,
@@ -46,39 +43,25 @@ LOCALHOST_REPLACEMENT_HOST = os.getenv("LOCALHOST_REPLACEMENT_HOST")
 
 # Environment-backed configuration (read once at import).
 PDF_TABLE_CSV_NEIGHBOR_PAGE_RADIUS = 1
-PDF_FIGURE_IMAGE_MIN_AREA = 15000
-PDF_FIGURE_IMAGE_MIN_SHORT_SIDE = 64
 PDF_FIGURE_NEIGHBOR_PAGE_RADIUS = 1
 PDF_QUOTE_CHUNK_MAX_FIGURE_IMAGES = 4
 PDF_READER_SAVED_DIR = ""
 PDF_FIGURE_ARTIFACT_MAX_PER_PAGE = 2
-PDF_TABLE_CSV_PRECOMPUTE = "1"
-PRECOMPUTE_TABLE_FIGURE_MODEL = "gpt-4o-mini"
+# QUOTE_EXTRACTION_MODEL = "gpt-oss-120b"
 QUOTE_EXTRACTION_MODEL = "gpt-4o-mini"
 OPENAI_PDF_QUOTES_TIMEOUT = 120
-OPENAI_PDF_TABLE_FIGURE_TIMEOUT = 120
-PDF_TABLE_PRECOMPUTE_MAX_CALLS = 48
-PDF_TABLE_FIGURE_PAGE_TEXT_CHARS = 6000
-PDF_TABLE_FIGURE_RENDER_MAX_SIDE = 1200
-PDF_TABLE_VISION_CREATE_ARTIFACTS = "1"
-PDF_TABLE_VISION_ARTIFACT_MAX = 48
-PDF_TABLE_SAVE_PAGE_PNG = "0"
 PDF_QUOTES_MAX_PAGE_CHARS = 40000
 PDF_QUOTES_STRATEGY = "chunked"
 PDF_QUOTES_CHUNK_CHARS = 12000
-PDF_QUOTES_FULL_DOC_MAX_CHARS = 1000000
-PDF_QUOTE_FULL_DOC_MAX_FIGURE_IMAGES = 6
-PDF_SUMMARY_MAX_CHARS = 20000
 
 DESCRIPTION = """\
 This agent can read and extract information from PDF documents. It:
 - Extracts PDF URLs from user messages
 - Downloads PDF files from URLs
 - Extracts text content and structure from PDFs using advanced parsing
-- Page range: **omit `end_page` (leave unset / null) to read the whole PDF from `start_page` through the last page.** If `end_page` is set, only that span is extracted (and optional `max_pages` may tighten it further). The document may still report a larger total page count—only the requested span is processed.
 - Returns extracted information so iChatBio can answer questions about the PDF content
 
-To use this agent, simply mention a PDF URL in your message. The agent will automatically detect it, download the PDF, and extract text for analysis (full document unless you pass `end_page`).
+To use this agent, simply mention a PDF URL in your message. The agent will automatically detect it, download the PDF, and extract text for analysis.
 """
 
 
@@ -228,62 +211,52 @@ def _attach_precomputed_table_csv_to_findings(
         if csv_s and from_pg is not None:
             f["csv_content"] = csv_s
             f["csv_content_source"] = (
-                f"vision_full_page_render_pdf_page_{from_pg}"
+                f"pymupdf4llm_table_extract_pdf_page_{from_pg}"
                 if from_pg == pg
                 else (
-                    f"vision_full_page_render_pdf_page_{from_pg}_"
+                    f"pymupdf4llm_table_extract_pdf_page_{from_pg}_"
                     f"neighbor_of_quote_page_{pg}"
                 )
             )
 
 
-def _image_files_grouped_by_page(image_files: list[str]) -> dict[int, list[str]]:
-    by_page: dict[int, list[str]] = {}
-    for path in image_files or []:
-        m = re.search(r"page_(\d{4})_img_", Path(path).name)
-        if not m:
+def _embedded_images_grouped_by_page(
+    embedded_images_by_page: dict[int, list[dict[str, str]]] | None,
+) -> dict[int, list[dict[str, str]]]:
+    out: dict[int, list[dict[str, str]]] = {}
+    if not isinstance(embedded_images_by_page, dict):
+        return out
+    for k, items in embedded_images_by_page.items():
+        try:
+            page_num = int(k)
+        except (TypeError, ValueError):
             continue
-        p = int(m.group(1))
-        by_page.setdefault(p, []).append(path)
-    for p in by_page:
-        by_page[p] = sorted(by_page[p])
-    return by_page
-
-
-def _image_files_grouped_by_page_for_figures(image_files: list[str]) -> dict[int, list[str]]:
-    raw = _image_files_grouped_by_page(image_files)
-    min_area = PDF_FIGURE_IMAGE_MIN_AREA
-    min_side = PDF_FIGURE_IMAGE_MIN_SHORT_SIDE
-    out: dict[int, list[str]] = {}
-    for page_num, paths in raw.items():
-        out[page_num] = rank_embedded_image_paths_for_figure_artifacts(
-            paths,
-            min_area_px=min_area,
-            min_short_side_px=min_side,
-        )
+        if page_num < 1:
+            continue
+        clean_items: list[dict[str, str]] = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            b64 = str(item.get("base64") or "").strip()
+            if not b64:
+                continue
+            mime = str(item.get("mime") or "image/png").strip()
+            if not mime.startswith("image/"):
+                mime = "image/png"
+            clean_items.append({"base64": b64, "mime": mime})
+        if clean_items:
+            out[page_num] = clean_items
     return out
 
 
-def _embedded_image_1based_page_from_filename(path: str) -> Optional[int]:
-    m = re.search(r"page_(\d{4})_img_", Path(path).name)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except ValueError:
-        return None
-
-
-def _collect_ranked_figure_embedded_paths(
-    images_by_page: dict[int, list[str]],
+def _collect_figure_embedded_images(
+    images_by_page: dict[int, list[dict[str, str]]],
     center_pages: list[int],
     *,
     span_first: int,
     span_last: int,
-) -> list[str]:
+) -> list[dict[str, str]]:
     radius = PDF_FIGURE_NEIGHBOR_PAGE_RADIUS
-    min_area = PDF_FIGURE_IMAGE_MIN_AREA
-    min_side = PDF_FIGURE_IMAGE_MIN_SHORT_SIDE
 
     page_set: Set[int] = set()
     for cp in center_pages:
@@ -295,19 +268,12 @@ def _collect_ranked_figure_embedded_paths(
             page_set.add(cp + d)
 
     clipped = {p for p in page_set if span_first <= p <= span_last}
-    merged: list[str] = []
-    seen: set[str] = set()
+    merged: list[dict[str, str]] = []
     for pg in sorted(clipped):
-        for path in images_by_page.get(pg, []) or []:
-            if path not in seen:
-                seen.add(path)
-                merged.append(path)
-
-    return rank_embedded_image_paths_for_figure_artifacts(
-        merged,
-        min_area_px=min_area,
-        min_short_side_px=min_side,
-    )
+        for img in images_by_page.get(pg, []) or []:
+            if isinstance(img, dict):
+                merged.append(img)
+    return merged
 
 
 def _truncate_for_vision_prompt(s: str, n: int) -> str:
@@ -321,7 +287,7 @@ def _build_quote_chunk_user_content(
     chunk_body: str,
     pages_in_chunk: list[int],
     page_table_csv: dict[int, str],
-    images_by_page: dict[int, list[str]],
+    images_by_page: dict[int, list[dict[str, str]]],
     *,
     span_first: int,
     span_last: int,
@@ -339,7 +305,7 @@ def _build_quote_chunk_user_content(
             csv_s = page_table_csv.get(p)
             if isinstance(csv_s, str) and csv_s.strip():
                 extra_csv.append(
-                    f"--- Table CSV (vision transcription of full-page render, PDF page {p}) ---\n"
+                    f"--- Table CSV (from pymupdf4llm table.extract, PDF page {p}) ---\n"
                     f"{csv_s.strip()}"
                 )
                 had_table_csv = True
@@ -351,29 +317,26 @@ def _build_quote_chunk_user_content(
 
     image_parts: list[dict[str, Any]] = []
     if wants_fig:
-        ranked_paths = _collect_ranked_figure_embedded_paths(
+        embedded_images = _collect_figure_embedded_images(
             images_by_page,
             pages_in_chunk,
             span_first=span_first,
             span_last=span_last,
         )
         n_img = 0
-        for path in ranked_paths:
+        for img in embedded_images:
             if n_img >= max_fig:
                 break
-            pt = Path(path)
-            if not pt.is_file():
+            if not isinstance(img, dict):
                 continue
-            try:
-                raw = pt.read_bytes()
-            except OSError:
+            b64 = str(img.get("base64") or "").strip()
+            if not b64:
                 continue
-            if len(raw) > 8 * 1024 * 1024:
-                continue
-            mime = mimetypes.guess_type(str(pt))[0] or "image/png"
+            mime = str(img.get("mime") or "image/png").strip()
             if not mime.startswith("image/"):
                 mime = "image/png"
-            b64 = base64.b64encode(raw).decode("ascii")
+            if len(b64) > 11 * 1024 * 1024:
+                continue
             image_parts.append(
                 {
                     "type": "image_url",
@@ -384,8 +347,8 @@ def _build_quote_chunk_user_content(
 
     if image_parts:
         intro = (
-            "The block below is PDF excerpt text (and optional table CSV from a prior vision pass). "
-            "Following image(s) are embedded figures from page(s) in this excerpt; "
+            "The block below is PDF excerpt text (and optional table CSV from parsed table blocks). "
+            "Following image(s) are embedded figures from pymupdf4llm JSON on page(s) in this excerpt; "
             "figure captions such as \"Figure 1: …\" may appear only in the text. "
             "Read each image and extract information relevant to the user request.\n\n"
         )
@@ -491,9 +454,9 @@ class PDFReaderAgent(IChatBioAgent):
                         "artifact": params.pdf_artifact,
                     }
                 )
-                await process.log(
-                    f"Using PDF artifact from parameters: local_id={params.pdf_artifact.local_id}"
-                )
+                # await process.log(
+                #     f"Using PDF artifact from parameters: local_id={params.pdf_artifact.local_id}"
+                # )
             else:
                 pdf_urls: List[str] = []
 
@@ -546,7 +509,7 @@ class PDFReaderAgent(IChatBioAgent):
                 )
                 return
 
-            await process.log(f"Using saved outputs directory: {saved_base_dir}")
+            # await process.log(f"Using saved outputs directory: {saved_base_dir}")
 
             try:
  
@@ -574,10 +537,8 @@ class PDFReaderAgent(IChatBioAgent):
                             downloaded_path = download_pdf(pdf_url, pdf_path)
                             await process.log("PDF downloaded successfully!")
 
-                        library = "pypdf"
+                        library = "pymupdf4llm_json"
                         strategy = "fast"
-                        include_page_breaks = False
-                        infer_table_structure = True
                         start_page = 1
                         end_page = None
                         max_pages = None
@@ -616,32 +577,31 @@ class PDFReaderAgent(IChatBioAgent):
                                 "Omit end_page and max_pages for full-PDF extraction; "
                                 "set start_page=1 for page 1 through last."
                             )
-                        await process.log(parse_msg, data=parse_data)
+                        # await process.log(parse_msg, data=parse_data)
+                        await process.log(parse_msg)
 
-                        extracted_text_path = os.path.join(
-                            temp_dir, f"extracted_text_{idx + 1}.txt"
-                        )
+                        pdf_pipeline_start = time.perf_counter()
+                        pymupdf4llm_start_time = time.perf_counter()
 
-                        start_time = time.perf_counter()
-
-                        elements, text_length = read_pdf_with_pypdf(
+                        (
+                            elements,
+                            text_length,
+                            page_table_csv,
+                            embedded_images_by_page,
+                        ) = read_pdf_with_pymupdf4llm_json(
                             pdf_path=downloaded_path,
-                            strategy=strategy,
-                            include_page_breaks=include_page_breaks,
-                            infer_table_structure=infer_table_structure,
                             start_page=start_page,
                             end_page=end_page_effective,
-                            max_pages=max_pages_effective,
-                            text_output_path=extracted_text_path,
+                            max_pages=max_pages_effective
                         )
 
-                        extraction_time = time.perf_counter() - start_time
+                        extraction_time = time.perf_counter() - pymupdf4llm_start_time
                         await process.log(
                             f"PDF extraction processing time: {extraction_time:.3f} seconds",
-                            data={
-                                "processing_time_seconds": extraction_time,
-                                "library": library
-                            },
+                            # data={
+                            #     "processing_time_seconds": extraction_time,
+                            #     "library": library
+                            # },
                         )
 
                         if not elements:
@@ -663,78 +623,52 @@ class PDFReaderAgent(IChatBioAgent):
                             },
                         )
 
-                        raw_text = Path(extracted_text_path).read_text(
-                            encoding="utf-8", errors="replace"
-                        )
-                        refined_plain_text = clean_pdf_extracted_text(raw_text)
-                        Path(extracted_text_path).write_text(
-                            refined_plain_text, encoding="utf-8"
-                        )
-                        text_length = len(refined_plain_text)
-
                         structured_blocks = self._build_structured_blocks(elements, library)
                         for blk in structured_blocks:
                             if blk.get("type") == "text" and isinstance(blk.get("text"), str):
                                 blk["text"] = clean_pdf_extracted_text(blk["text"])
 
-                        page_texts_for_vision = self._build_page_texts_from_structured_blocks(
-                            structured_blocks
+                        table_count_from_elements = sum(
+                            1
+                            for e in elements
+                            if isinstance(e, dict) and str(e.get("type", "")).lower() == "table"
                         )
-
-                        source_label = source.get("url") or f"artifact_{idx + 1}"
-                        # a table (e.g. "Table …") are rasterized and sent to the vision LLM instead.
                         table_extraction: Dict[str, Any] = {
-                            "table_count": 0,
+                            "table_count": table_count_from_elements,
                             "table_files": [],
                             "tables_by_page": {},
                             "output_dir": "",
                             "error": "",
                         }
-                        image_extraction: Dict[str, Any] = {
-                            "image_count": 0,
-                            "image_files": [],
-                            "images_by_page": {},
-                            "output_dir": "",
-                            "error": "",
-                        }
-                        try:
-                            image_extraction = extract_images_with_pymupdf(
-                                pdf_path=downloaded_path,
-                                output_dir=str(saved_base_dir),
-                                source_name=source_label,
-                                start_page=span_first,
-                                end_page=span_last,
-                            )
- 
-                        except Exception as img_exc:
-                            image_extraction["error"] = str(img_exc)
-                            await process.log(
-                                f"Warning: Image extraction failed for {pdf_url}: {img_exc}"
-                            )
+                        image_extraction_seconds = 0.0
+                        embedded_images_by_page = _embedded_images_grouped_by_page(
+                            embedded_images_by_page
+                        )
+                        embedded_image_count = sum(
+                            len(v) for v in embedded_images_by_page.values()
+                        )
+                        # await process.log(
+                        #     "Embedded images extracted from pymupdf4llm JSON.",
+                        #     data={
+                        #         "embedded_image_count": embedded_image_count,
+                        #         "embedded_image_pages": len(embedded_images_by_page),
+                        #     },
+                        # )
 
-                        page_table_csv: dict[int, str] = {}
-                        if PYMUPDF_AVAILABLE and downloaded_path:
-                            try:
-                                page_table_csv = await self._precompute_page_table_csvs(
-                                    process=process,
-                                    pdf_path=downloaded_path,
-                                    page_texts=page_texts_for_vision,
-                                    span_first=span_first,
-                                    span_last=span_last,
-                                    request=request,
-                                    saved_base_dir=str(saved_base_dir)
-                                    if saved_base_dir is not None
-                                    else None,
-                                    source_label=source_label,
-                                )
-                            except Exception as pre_exc:
-                                await process.log(
-                                    f"Warning: table CSV precompute failed: {pre_exc}"
-                                )
+                        # page_table_csv = dict(page_table_csv or {})
+                        # table_csv_precompute_seconds = 0.0
 
-                        image_files_list = list(image_extraction.get("image_files") or [])
+                        # await process.log(
+                        #     "Table CSV extracted from pymupdf4llm JSON (no vision precompute).",
+                        #     data={
+                        #         "tables_detected": table_count_from_elements,
+                        #         "pages_with_table_csv": len(page_table_csv),
+                        #         "table_csv_precompute_seconds": table_csv_precompute_seconds,
+                        #     },
+                        # )
 
                         quote_findings: list[dict] = []
+                        quote_extract_start = time.perf_counter()
                         quote_findings = await self._extract_quotes_from_structured_blocks(
                             process=process,
                             request=request,
@@ -745,7 +679,28 @@ class PDFReaderAgent(IChatBioAgent):
                             span_first=span_first,
                             span_last=span_last,
                             page_table_csv=page_table_csv,
-                            image_files=image_files_list,
+                            embedded_images_by_page=embedded_images_by_page,
+                        )
+                        quote_extraction_seconds = time.perf_counter() - quote_extract_start
+                        total_pdf_pipeline_seconds = (
+                            time.perf_counter() - pdf_pipeline_start
+                        )
+                        await process.log(
+                            "PDF per-file timing summary",
+                            data={
+                                # "source_url": pdf_url,
+                                "pymupdf4llm_extract_seconds": round(extraction_time, 4),
+                                "image_extract_seconds": round(image_extraction_seconds, 4),
+                                "table_csv_precompute_seconds": round(
+                                    0, 4
+                                ),
+                                "quote_extraction_seconds": round(
+                                    quote_extraction_seconds, 4
+                                ),
+                                "total_pdf_pipeline_seconds": round(
+                                    total_pdf_pipeline_seconds, 4
+                                ),
+                            },
                         )
 
                         result = {
@@ -761,45 +716,27 @@ class PDFReaderAgent(IChatBioAgent):
                             "table_files": table_extraction.get("table_files", []),
                             "table_output_dir": table_extraction.get("output_dir", ""),
                             "table_error": table_extraction.get("error", ""),
-                            "image_count": image_extraction.get("image_count", 0),
-                            "image_files": image_extraction.get("image_files", []),
-                            "image_output_dir": image_extraction.get("output_dir", ""),
-                            "image_error": image_extraction.get("error", ""),
+                            "image_count": embedded_image_count,
+                            "image_files": [],
+                            "image_output_dir": "",
+                            "image_error": "",
                             "total_pdf_pages": total_pdf_pages,
                             "extract_first_page": span_first,
                             "extract_last_page": span_last,
+                            "timing_seconds": {
+                                "pymupdf4llm_extract": round(extraction_time, 4),
+                                "image_extract": round(image_extraction_seconds, 4),
+                                "table_csv_precompute": round(
+                                    0, 4
+                                ),
+                                "quote_extraction": round(quote_extraction_seconds, 4),
+                                "total_pdf_pipeline": round(
+                                    total_pdf_pipeline_seconds, 4
+                                ),
+                            },
                         }
 
                         all_results.append(result)
-
-                        artifact_description = f"Extracted text content from PDF: {pdf_url}"
-                        if len(pdf_sources) > 1:
-                            artifact_description += f" (PDF {idx + 1} of {len(pdf_sources)})"
-                        artifact_description += f" (pages {span_first}-{span_last})"
-                        artifact_description += " — cleaned (line breaks normalized)"
-
-                        text_artifact_bytes = refined_plain_text.encode("utf-8")
-
-                        await process.create_artifact(
-                            mimetype="text/plain",
-                            description=artifact_description,
-                            content=text_artifact_bytes,
-                            metadata={
-                                "source_url": pdf_url,
-                                "total_elements": stats['total_elements'],
-                                "element_types": stats['element_types'],
-                                "text_length": text_length,
-                                "strategy": strategy,
-                                "library": library,
-                                "pdf_index": idx + 1,
-                                "total_pdfs": len(pdf_sources),
-                                "total_pdf_pages": total_pdf_pages,
-                                "extract_first_page": span_first,
-                                "extract_last_page": span_last
-                            }
-                        )
-
-                        text_artifact_bytes = b""
 
                         try:
                             qf_list = result.get("quote_findings") or []
@@ -812,72 +749,56 @@ class PDFReaderAgent(IChatBioAgent):
                                     and isinstance(f.get("page"), int)
                                 }
                             )
-                            images_by_page_art = _image_files_grouped_by_page_for_figures(
-                                result.get("image_files") or []
+                            images_by_page_art = _embedded_images_grouped_by_page(
+                                embedded_images_by_page
                             )
-                            saved_base_dir_resolved = saved_base_dir.resolve()
                             max_fig_art = PDF_FIGURE_ARTIFACT_MAX_PER_PAGE
                             art_i = 0
                             for page_num in fig_pages:
-                                ranked_paths = _collect_ranked_figure_embedded_paths(
+                                candidate_images = _collect_figure_embedded_images(
                                     images_by_page_art,
                                     [page_num],
                                     span_first=span_first,
                                     span_last=span_last,
                                 )
-                                for image_path in ranked_paths[:max_fig_art]:
-                                    p = Path(image_path)
-                                    if not p.exists() or not p.is_file():
+                                for embedded in candidate_images[:max_fig_art]:
+                                    if not isinstance(embedded, dict):
                                         continue
-                                    mime = mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+                                    b64 = str(embedded.get("base64") or "").strip()
+                                    if not b64:
+                                        continue
+                                    mime = str(embedded.get("mime") or "image/png").strip()
                                     if not mime.startswith("image/"):
                                         mime = "image/png"
+                                    try:
+                                        image_bytes = base64.b64decode(b64)
+                                    except Exception:
+                                        continue
+                                    if not image_bytes:
+                                        continue
                                     art_i += 1
-                                    file_pg = _embedded_image_1based_page_from_filename(
-                                        str(image_path)
+                                    fig_desc = (
+                                        f"Figure image (page {page_num}, backed by quote "
+                                        f"finding, source=pymupdf4llm_json_embed): #{art_i}"
                                     )
-                                    if file_pg is not None and file_pg != page_num:
-                                        fig_desc = (
-                                            f"Figure image (embedded raster PDF page {file_pg}; "
-                                            f"quote attribution page {page_num}): {p.name}"
-                                        )
-                                    else:
-                                        fig_desc = (
-                                            f"Figure image (page {page_num}, backed by quote "
-                                            f"finding): {p.name}"
-                                        )
                                     await process.create_artifact(
                                         mimetype=mime,
                                         description=fig_desc,
-                                        content=p.read_bytes(),
+                                        content=image_bytes,
                                         metadata={
                                             "source_url": pdf_url,
-                                            "image_path": str(p),
                                             "pdf_page": page_num,
-                                            "embedded_raster_pdf_page": file_pg,
                                             "figure_from_quote_finding": True,
                                             "artifact_index": art_i,
                                             "figure_selection": (
-                                                "embedded_images_neighbor_pages_ranked_by_pixel_area"
+                                                "embedded_images_neighbor_pages_ordered_as_json"
                                             ),
                                         },
                                     )
-                                    try:
-                                        image_path_resolved = p.resolve()
-                                        image_path_resolved.relative_to(saved_base_dir_resolved)
-                                        image_path_resolved.unlink(missing_ok=True)
-                                    except ValueError:
-                                        await process.log(
-                                            f"Skipping image cleanup outside saved directory: {p}"
-                                        )
-                                    except Exception as cleanup_exc:
-                                        await process.log(
-                                            f"Warning: Failed to delete extracted image file {p}: {cleanup_exc}"
-                                        )
                             if fig_pages and art_i == 0:
                                 await process.log(
-                                    "Quote findings marked figure-relevant but no image files "
-                                    "were found on disk for those page(s).",
+                                    "Quote findings marked figure-relevant but no embedded images "
+                                    "were available for those page(s).",
                                     data={"figure_pages": fig_pages},
                                 )
                         except Exception as e:
@@ -988,14 +909,32 @@ class PDFReaderAgent(IChatBioAgent):
                             f"```json\n{json.dumps(quote_payload, ensure_ascii=False, indent=2, default=str)}\n```\n"
                         )
                         summary += (
-                            "  - Tables: detected from text cues (e.g. “Table …”); "
-                            "each candidate page is rendered to an image and CSV is produced by the vision model "
+                            "  - Tables: read directly from pymupdf4llm JSON "
+                            "(boxclass=table, using table.extract converted to CSV)\n"
                         )
                         summary += f"  - Images extracted: {result.get('image_count', 0)}\n"
                         if result.get("image_output_dir"):
                             summary += f"  - Images saved to: {result.get('image_output_dir')}\n"
                         if result.get("image_error"):
                             summary += f"  - Image extraction warning: {result.get('image_error')}\n"
+                        timing = result.get("timing_seconds") or {}
+                        if timing:
+                            summary += "  - Timing (seconds):\n"
+                            summary += (
+                                f"    - pymupdf4llm_extract: {timing.get('pymupdf4llm_extract', 0)}\n"
+                            )
+                            summary += (
+                                f"    - image_extract: {timing.get('image_extract', 0)}\n"
+                            )
+                            summary += (
+                                f"    - table_csv_precompute: {timing.get('table_csv_precompute', 0)}\n"
+                            )
+                            summary += (
+                                f"    - quote_extraction: {timing.get('quote_extraction', 0)}\n"
+                            )
+                            summary += (
+                                f"    - total_pdf_pipeline: {timing.get('total_pdf_pipeline', 0)}\n"
+                            )
                         image_files_for_reply = result.get("image_files", []) or []
                         if image_files_for_reply:
                             image_details = {
@@ -1049,13 +988,13 @@ class PDFReaderAgent(IChatBioAgent):
 
         for element in elements or []:
             if isinstance(element, dict):
-                element_type = element.get("type", "Unknown")
+                element_type = str(element.get("type", "Unknown"))
                 text = element.get("text", "") or ""
                 page_meta = element.get("metadata", {})
                 page_number = element.get("page_number") or page_meta.get("page_number") or 1
                 page_idx = max(int(page_number), 1)
 
-                if element_type == "Text" and text.strip():
+                if element_type.lower() == "text" and text.strip():
                     structured.append(
                         {
                             "type": "text",
@@ -1063,6 +1002,24 @@ class PDFReaderAgent(IChatBioAgent):
                             "page_number": page_idx,
                         }
                     )
+                    continue
+                if element_type.lower() == "table":
+                    table_body = ""
+                    table_csv = element.get("table_csv")
+                    if isinstance(table_csv, str) and table_csv.strip():
+                        table_body = table_csv.strip()
+                    elif isinstance(text, str) and text.strip():
+                        table_body = text.strip()
+                    if table_body:
+                        structured.append(
+                            {
+                                "type": "table",
+                                "table_body": table_body,
+                                "table_caption": [],
+                                "table_footnote": [],
+                                "page_number": page_idx,
+                            }
+                        )
                 continue
 
             element_type = type(element).__name__
@@ -1153,7 +1110,7 @@ class PDFReaderAgent(IChatBioAgent):
                         with open(output_path, "wb") as f:
                             f.write(resp.content)
                         await process.log(
-                            f"Downloaded artifact {artifact.local_id} to {output_path}"
+                            f"Downloaded artifact {artifact.local_id}"
                         )
                         return output_path, url
                     else:
@@ -1231,140 +1188,199 @@ class PDFReaderAgent(IChatBioAgent):
             page_texts[page_idx] = (previous + "\n" + text) if previous else text
         return page_texts
 
-    async def _precompute_page_table_csvs(
-        self,
-        process: IChatBioAgentProcess,
-        pdf_path: str,
-        page_texts: dict[int, str],
-        span_first: int,
-        span_last: int,
-        request: str,
-        *,
-        saved_base_dir: str | None = None,
-        source_label: str = "pdf",
-    ) -> dict[int, str]:
-        flag = PDF_TABLE_CSV_PRECOMPUTE.strip().lower()
-        if flag in ("0", "false", "no", "off"):
-            return {}
-        if not PYMUPDF_AVAILABLE:
-            return {}
+    # async def _precompute_page_table_csvs(
+    #     self,
+    #     process: IChatBioAgentProcess,
+    #     pdf_path: str,
+    #     page_texts: dict[int, str],
+    #     span_first: int,
+    #     span_last: int,
+    #     request: str,
+    #     *,
+    #     saved_base_dir: str | None = None,
+    #     source_label: str = "pdf",
+    # ) -> dict[int, str]:
+    #     flag = PDF_TABLE_CSV_PRECOMPUTE.strip().lower()
+    #     if flag in ("0", "false", "no", "off"):
+    #         return {}
+    #     if not PYMUPDF_AVAILABLE:
+    #         return {}
 
-        model = PRECOMPUTE_TABLE_FIGURE_MODEL
-        timeout = OPENAI_PDF_TABLE_FIGURE_TIMEOUT
-        max_calls = PDF_TABLE_PRECOMPUTE_MAX_CALLS
-        max_page_text = PDF_TABLE_FIGURE_PAGE_TEXT_CHARS
-        render_max_side = PDF_TABLE_FIGURE_RENDER_MAX_SIDE
+    #     model = PRECOMPUTE_TABLE_FIGURE_MODEL
+    #     timeout = OPENAI_PDF_TABLE_FIGURE_TIMEOUT
+    #     max_calls = PDF_TABLE_PRECOMPUTE_MAX_CALLS
+    #     max_page_text = PDF_TABLE_FIGURE_PAGE_TEXT_CHARS
+    #     render_max_side = PDF_TABLE_FIGURE_RENDER_MAX_SIDE
 
-        cue_table, _cue_fig = find_table_figure_cue_pages(page_texts)
-        table_word_pages = find_pages_with_table_word(page_texts)
-        span_pages = set(range(int(span_first), int(span_last) + 1))
-        extra = _extra_table_pages_for_user_request(request, page_texts, span_pages)
-        candidate_pages = sorted((cue_table | table_word_pages | extra) & span_pages)
+    #     cue_table, _cue_fig = find_table_figure_cue_pages(page_texts)
+    #     table_word_pages = find_pages_with_table_word(page_texts)
+    #     span_pages = set(range(int(span_first), int(span_last) + 1))
+    #     extra = _extra_table_pages_for_user_request(request, page_texts, span_pages)
+    #     candidate_pages = sorted((cue_table | table_word_pages | extra) & span_pages)
 
-        create_art = PDF_TABLE_VISION_CREATE_ARTIFACTS.strip().lower() not in (
-            "0",
-            "false",
-            "no",
-            "off",
-        )
-        art_max = PDF_TABLE_VISION_ARTIFACT_MAX
-        art_n = 0
-        save_png = PDF_TABLE_SAVE_PAGE_PNG.strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
-        save_dir: Path | None = None
-        if save_png and saved_base_dir:
-            save_dir = Path(saved_base_dir) / _safe_name(source_label, "pdf") / "table_vision"
-            save_dir.mkdir(parents=True, exist_ok=True)
+    #     create_art = PDF_TABLE_VISION_CREATE_ARTIFACTS.strip().lower() not in (
+    #         "0",
+    #         "false",
+    #         "no",
+    #         "off",
+    #     )
+    #     art_max = PDF_TABLE_VISION_ARTIFACT_MAX
+    #     art_n = 0
+    #     save_png = PDF_TABLE_SAVE_PAGE_PNG.strip().lower() in (
+    #         "1",
+    #         "true",
+    #         "yes",
+    #         "on",
+    #     )
+    #     save_dir: Path | None = None
+    #     if save_png and saved_base_dir:
+    #         save_dir = Path(saved_base_dir) / _safe_name(source_label, "pdf") / "table_vision"
+    #         save_dir.mkdir(parents=True, exist_ok=True)
 
-        sys_pre = (
-            "You see a full-page raster image of one PDF page (PyMuPDF) plus the same page's extracted plain text.\n"
-            "The page was chosen because its text likely refers to a table (caption or the word Table).\n"
-            "Transcribe any visible data table as CSV (comma-separated; header row when clear). "
-            "If there is no table in the image, return an empty tabular_csv string.\n"
-            "Do not invent cells; only transcribe what is visible.\n"
-            'Return ONLY JSON: {"tabular_csv": "<string>"}'
-        )
+    #     sys_pre = (
+    #         "You see a full-page raster image of one PDF page (PyMuPDF) plus the same page's extracted plain text.\n"
+    #         "The page was chosen because its text likely refers to a table (caption or the word Table).\n"
+    #         "Transcribe any visible data table as CSV (comma-separated; header row when clear). "
+    #         "If there is no table in the image, return an empty tabular_csv string.\n"
+    #         "Do not invent cells; only transcribe what is visible.\n"
+    #         'Return ONLY JSON: {"tabular_csv": "<string>"}'
+    #     )
 
-        out: dict[int, str] = {}
-        calls = 0
-        client = OpenAI(timeout=timeout)
-        req_snip = (request or "").strip()[:500]
+    #     out: dict[int, str] = {}
+    #     calls = 0
+    #     client = OpenAI(timeout=timeout)
+    #     req_snip = (request or "").strip()[:500]
+    #     precompute_wall_start = time.perf_counter()
+    #     render_total_seconds = 0.0
+    #     llm_total_seconds = 0.0
+    #     llm_success_calls = 0
+    #     pages_with_csv = 0
 
-        for page in candidate_pages:
-            if calls >= max_calls:
-                break
-            try:
-                png_bytes = render_pdf_page_to_png_bytes(
-                    pdf_path, page, max_side_px=render_max_side
-                )
-            except Exception as exc:
-                await process.log(f"Table CSV precompute: page render failed (page {page}): {exc}")
-                continue
-            page_text = _truncate_for_vision_prompt(page_texts.get(page, ""), max_page_text)
-            b64_png = base64.b64encode(png_bytes).decode("ascii")
-            user_block = (
-                f"(Context) User request (may be vague): {req_snip}\n\n"
-                f"Page number (1-based): {page}\n\n"
-                f"Page text:\n{page_text}\n"
-            )
-            calls += 1
-            content = ""
-            try:
-                resp = client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": sys_pre},
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": user_block},
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": f"data:image/png;base64,{b64_png}"},
-                                },
-                            ],
-                        },
-                    ],
-                    temperature=0.0,
-                )
-                content = (resp.choices[0].message.content or "").strip()
-            except Exception as exc:
-                await process.log(f"Table CSV precompute LLM error page {page}: {exc}")
-                continue
+    #     for page in candidate_pages:
+    #         if calls >= max_calls:
+    #             break
+    #         page_start = time.perf_counter()
+    #         render_seconds = 0.0
+    #         try:
+    #             render_start = time.perf_counter()
+    #             png_bytes = render_pdf_page_to_png_bytes(
+    #                 pdf_path, page, max_side_px=render_max_side
+    #             )
+    #             render_seconds = time.perf_counter() - render_start
+    #             render_total_seconds += render_seconds
+    #         except Exception as exc:
+    #             await process.log(f"Table CSV precompute: page render failed (page {page}): {exc}")
+    #             continue
+    #         page_text = _truncate_for_vision_prompt(page_texts.get(page, ""), max_page_text)
+    #         b64_png = base64.b64encode(png_bytes).decode("ascii")
+    #         user_block = (
+    #             f"(Context) User request (may be vague): {req_snip}\n\n"
+    #             f"Page number (1-based): {page}\n\n"
+    #             f"Page text:\n{page_text}\n"
+    #         )
+    #         calls += 1
+    #         content = ""
+    #         llm_seconds = 0.0
+    #         try:
+    #             llm_start = time.perf_counter()
+    #             resp = client.chat.completions.create(
+    #                 model=model,
+    #                 messages=[
+    #                     {"role": "system", "content": sys_pre},
+    #                     {
+    #                         "role": "user",
+    #                         "content": [
+    #                             {"type": "text", "text": user_block},
+    #                             {
+    #                                 "type": "image_url",
+    #                                 "image_url": {"url": f"data:image/png;base64,{b64_png}"},
+    #                             },
+    #                         ],
+    #                     },
+    #                 ],
+    #                 temperature=0.0,
+    #             )
+    #             llm_seconds = time.perf_counter() - llm_start
+    #             llm_total_seconds += llm_seconds
+    #             llm_success_calls += 1
+    #             content = (resp.choices[0].message.content or "").strip()
+    #         except Exception as exc:
+    #             await process.log(f"Table CSV precompute LLM error page {page}: {exc}")
+    #             continue
 
-            if save_dir is not None:
-                try:
-                    (save_dir / f"page_{page:04d}_render.png").write_bytes(png_bytes)
-                except OSError as exc:
-                    await process.log(f"Table CSV precompute: failed to save PNG page {page}: {exc}")
+    #         if save_dir is not None:
+    #             try:
+    #                 (save_dir / f"page_{page:04d}_render.png").write_bytes(png_bytes)
+    #             except OSError as exc:
+    #                 await process.log(f"Table CSV precompute: failed to save PNG page {page}: {exc}")
 
-            parsed = _parse_json_object_from_response(content)
-            if not isinstance(parsed, dict):
-                continue
-            tab_csv = str(parsed.get("tabular_csv") or "").strip()
-            if tab_csv:
-                out[page] = tab_csv
+    #         parsed = _parse_json_object_from_response(content)
+    #         if not isinstance(parsed, dict):
+    #             continue
+    #         tab_csv = str(parsed.get("tabular_csv") or "").strip()
+    #         if tab_csv:
+    #             out[page] = tab_csv
+    #             pages_with_csv += 1
 
-        if out:
-            await process.log(
-                f"Table CSV precompute: stored CSV for {len(out)} page(s).",
-                data={
-                    "model": model,
-                    "vision_calls": calls,
-                    "candidate_pages": len(candidate_pages),
-                    "table_vision_artifacts_created": art_n,
-                },
-            )
-        elif calls > 0:
-            await process.log(
-                "Table CSV precompute: vision ran but no non-empty CSV returned.",
-                data={"model": model, "vision_calls": calls},
-            )
-        return out
+    #     precompute_wall_seconds = time.perf_counter() - precompute_wall_start
+    #     if out:
+    #         await process.log(
+    #             f"Table CSV precompute: stored CSV for {len(out)} page(s).",
+    #             data={
+    #                 "model": model,
+    #                 "vision_calls": calls,
+    #                 "candidate_pages": len(candidate_pages),
+    #                 "table_vision_artifacts_created": art_n,
+    #                 "timing_seconds_total": round(precompute_wall_seconds, 4),
+    #                 "timing_seconds_render_total": round(render_total_seconds, 4),
+    #                 "timing_seconds_llm_total": round(llm_total_seconds, 4),
+    #                 "timing_seconds_render_avg": round(
+    #                     (render_total_seconds / calls), 4
+    #                 )
+    #                 if calls > 0
+    #                 else 0.0,
+    #                 "timing_seconds_llm_avg": round(
+    #                     (llm_total_seconds / llm_success_calls), 4
+    #                 )
+    #                 if llm_success_calls > 0
+    #                 else 0.0,
+    #                 "pages_with_csv": pages_with_csv,
+    #             },
+    #         )
+    #     elif calls > 0:
+    #         await process.log(
+    #             "Table CSV precompute: vision ran but no non-empty CSV returned.",
+    #             data={
+    #                 "model": model,
+    #                 "vision_calls": calls,
+    #                 "candidate_pages": len(candidate_pages),
+    #                 "timing_seconds_total": round(precompute_wall_seconds, 4),
+    #                 "timing_seconds_render_total": round(render_total_seconds, 4),
+    #                 "timing_seconds_llm_total": round(llm_total_seconds, 4),
+    #                 "timing_seconds_render_avg": round(
+    #                     (render_total_seconds / calls), 4
+    #                 )
+    #                 if calls > 0
+    #                 else 0.0,
+    #                 "timing_seconds_llm_avg": round(
+    #                     (llm_total_seconds / llm_success_calls), 4
+    #                 )
+    #                 if llm_success_calls > 0
+    #                 else 0.0,
+    #                 "pages_with_csv": pages_with_csv,
+    #             },
+    #         )
+    #     elif candidate_pages:
+    #         await process.log(
+    #             "Table CSV precompute: candidate pages found but no LLM calls were made.",
+    #             data={
+    #                 "model": model,
+    #                 "candidate_pages": len(candidate_pages),
+    #                 "max_calls": max_calls,
+    #                 "timing_seconds_total": round(precompute_wall_seconds, 4),
+    #             },
+    #         )
+    #     return out
 
     async def _extract_quotes_from_structured_blocks(
         self,
@@ -1378,7 +1394,7 @@ class PDFReaderAgent(IChatBioAgent):
         span_first: int | None = None,
         span_last: int | None = None,
         page_table_csv: dict[int, str] | None = None,
-        image_files: list[str] | None = None,
+        embedded_images_by_page: dict[int, list[dict[str, str]]] | None = None,
     ) -> list[dict]:
         req = (request or "").strip()
         if not req:
@@ -1422,9 +1438,7 @@ class PDFReaderAgent(IChatBioAgent):
         )
 
         page_table_csv = dict(page_table_csv or {})
-        images_by_page = _image_files_grouped_by_page_for_figures(
-            list(image_files or [])
-        )
+        images_by_page = _embedded_images_grouped_by_page(embedded_images_by_page)
         multimodal_assets = bool(page_table_csv or images_by_page)
 
         quote_findings: list[dict] = []
@@ -1437,10 +1451,8 @@ class PDFReaderAgent(IChatBioAgent):
         usage_total_tokens = 0
         llm_request_count = 0
 
-        _raw_strategy = PDF_QUOTES_STRATEGY
-        strategy = _raw_strategy.strip().lower()
-        quote_timeout = OPENAI_PDF_QUOTES_TIMEOUT
-        client = OpenAI(timeout=quote_timeout)
+        strategy = PDF_QUOTES_STRATEGY.strip().lower()
+        client = OpenAI(timeout=OPENAI_PDF_QUOTES_TIMEOUT)
 
         system_message = (
             "You receive one user request string and document text (often with page markers). "
@@ -1472,8 +1484,8 @@ class PDFReaderAgent(IChatBioAgent):
         )
         if multimodal_assets:
             system_message += (
-                " The excerpt may additionally include table CSV (machine-transcribed from full-page images) "
-                "and/or embedded figure images for pages in range; use them together with the text to answer. "
+                " The excerpt may additionally include table CSV (parsed from PDF table structure) "
+                "and/or embedded figure images from the PDF JSON for pages in range; use them together with the text to answer. "
                 "When the excerpt contains the word Figure, image(s) may follow the text—read them for facts "
                 "relevant to the user request. When it contains Table, CSV lines may follow—quote exact CSV "
                 "substrings if they answer the request."

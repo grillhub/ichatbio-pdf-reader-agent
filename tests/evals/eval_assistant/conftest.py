@@ -26,7 +26,8 @@ async def _read_chat_loop(chat_loop: AsyncIterator[assistant.AsyncChatLoopItem])
 
 @pytest.fixture
 def llm_assistant():
-    return LLMAssistant(model="gpt-4.1-mini")
+    return LLMAssistant(model="gpt-oss-120b")
+    # return LLMAssistant(model="gpt-4o-mini")
 
 
 @pytest_asyncio.fixture

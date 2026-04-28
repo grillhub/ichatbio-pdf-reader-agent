@@ -28,7 +28,8 @@ def _equivalence_metric() -> GEval:
         criteria="Determine if the 'actual output' is semantically equivalent to 'expected output'. Cosmetic differences"
         " are okay.",
         evaluation_params=[LLMTestCaseParams.ACTUAL_OUTPUT, LLMTestCaseParams.EXPECTED_OUTPUT],
-        model="gpt-4.1-mini",
+        model="gpt-oss-120b",
+        # model="gpt-4o-mini",
         async_mode=False,
     )
 
