@@ -175,3 +175,4 @@ cython_debug/
 
 saved/
 allure-results*/
+tests/evals/eval_assistant/output/

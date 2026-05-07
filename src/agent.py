@@ -1,4 +1,8 @@
-from typing import override, Optional, List, Dict, Any, Set
+from typing import Optional, List, Dict, Any, Set
+try:
+    from typing import override
+except ImportError:
+    from typing_extensions import override
 import asyncio
 import time
 import json
@@ -7,6 +11,7 @@ import tempfile
 import os
 import gc
 import base64
+import hashlib
 from pathlib import Path
 
 import httpx
@@ -58,6 +63,10 @@ PDF_QUOTES_CHUNK_CHARS = 12000
 PDF_QUOTES_LLM_BATCH_SIZE = 5
 PDF_QUOTES_MAX_SEARCH_PAGES = 20
 PDF_QUOTES_QUERY_TERM_COUNT = 16
+PDF_QUOTES_TOP_SCORING_CHUNKS = 5
+PDF_QUOTES_TOP_SCORING_PAGES = 10
+ENABLED_FUZZY_SEARCH = True
+ENABLED_EXHAUSTIVE_SEARCH = True
 
 DESCRIPTION = """\
 This agent can read and extract information from PDF documents. It:
@@ -67,7 +76,61 @@ This agent can read and extract information from PDF documents. It:
 - Returns extracted information so iChatBio can answer questions about the PDF content
 
 To use this agent, simply mention a PDF URL in your message. The agent will automatically detect it, download the PDF, and extract text for analysis.
+
+Entrypoint parameters (read_pdf):
+- pdf_url: optional direct URL to a PDF (otherwise URLs are taken from the user message).
+- pdf_artifact: optional uploaded PDF artifact instead of a URL.
 """
+
+
+async def _quote_finding_loading_heartbeat(
+    process: IChatBioAgentProcess,
+    stop: asyncio.Event,
+    progress: dict[str, Any],
+    interval_s: float = 60.0,
+) -> None:
+    """Emit quote-finding progress every interval_s until stop is set."""
+    ticks = 0
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_s)
+        except asyncio.TimeoutError:
+            ticks += 1
+            elapsed = int(ticks * interval_s)
+            stage = str(progress.get("stage") or "Finding information in PDF")
+            page = progress.get("current_page")
+            pages_done = int(progress.get("pages_done") or 0)
+            pages_total = int(progress.get("pages_total") or 0)
+            chunk_done = int(progress.get("chunks_done") or 0)
+            chunk_total = int(progress.get("chunks_total") or 0)
+            if isinstance(page, int):
+                await process.log(
+                    f"{stage}... still loading ({elapsed}s elapsed). "
+                    f"Finding information on page {page}. "
+                    f"Scanned pages: {pages_done}/{pages_total}; chunks: {chunk_done}/{chunk_total}."
+                )
+            else:
+                await process.log(
+                    f"{stage}... still loading ({elapsed}s elapsed). "
+                    f"Scanned pages: {pages_done}/{pages_total}; chunks: {chunk_done}/{chunk_total}."
+                )
+
+
+async def _pdf_stage_loading_heartbeat(
+    process: IChatBioAgentProcess,
+    stop: asyncio.Event,
+    stage: str,
+    interval_s: float = 60.0,
+) -> None:
+    """Emit stage progress periodically until stop is set."""
+    ticks = 0
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval_s)
+        except asyncio.TimeoutError:
+            ticks += 1
+            elapsed = int(ticks * interval_s)
+            await process.log(f"{stage}... still loading ({elapsed}s elapsed)")
 
 
 class PDFReaderParams(BaseModel):
@@ -79,7 +142,6 @@ class PDFReaderParams(BaseModel):
         default=None,
         description="Artifact containing a PDF file to read instead of a URL."
     )
-    # is_specific_request: bool = Field(default=False)
 
 def _coerce_llm_quote_list_item(entry: Any) -> tuple[str, str] | None:
     if isinstance(entry, str):
@@ -110,6 +172,96 @@ def _parse_json_object_from_response(content: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return obj if isinstance(obj, dict) else None
+
+
+# Words split from the user request for fuzzy retrieval (never the full sentence as one term:
+# find_near_matches uses a tiny max edit distance for long strings, so long phrases score 0).
+_REQUEST_RETRIEVAL_STOPWORDS = frozenset(
+    {
+        "the",
+        "and",
+        "for",
+        "from",
+        "with",
+        "all",
+        "are",
+        "was",
+        "were",
+        "not",
+        "but",
+        "has",
+        "have",
+        "had",
+        "this",
+        "that",
+        "any",
+        "use",
+        "using",
+        "can",
+        "will",
+        "may",
+        "please",
+        "user",
+        "upload",
+        "pdf",
+        "file",
+        "document",
+        "into",
+        "over",
+        "such",
+        "than",
+        "then",
+        "them",
+        "they",
+        "their",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "your",
+        "you",
+        "how",
+        "why",
+        "extract",
+        "occurrences",
+        "mentioned",
+        "context",
+        "return",
+        "list",
+        "find",
+        "search",
+        "read",
+        "give",
+        "show",
+        "tell",
+        "describe",
+        "about",
+        "some",
+        "each",
+        "every",
+    }
+)
+
+
+def _retrieval_tokens_from_request(
+    req: str, *, seen: set[str], max_extra: int = 24
+) -> list[str]:
+    if not (req or "").strip():
+        return []
+    out: list[str] = []
+    for m in re.finditer(r"\w{3,}", req, flags=re.UNICODE):
+        w = m.group(0)
+        lw = w.lower()
+        if lw in _REQUEST_RETRIEVAL_STOPWORDS:
+            continue
+        if lw in seen:
+            continue
+        seen.add(lw)
+        out.append(w)
+        if len(out) >= max_extra:
+            break
+    return out
 
 
 def _export_quote_finding(finding: dict) -> dict | None:
@@ -413,6 +565,73 @@ def _finding_should_attach_figure_artifact(
     return True
 
 
+def _normalize_for_quote_match(s: str) -> str:
+    s = (s or "").replace("\u00a0", " ")
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _resolve_quote_page(
+    quote_clean: str,
+    pages_in_chunk: list[int],
+    page_texts: dict[int, str],
+    max_chars_per_page: int,
+) -> int | None:
+    # 1) Exact substring on in-chunk pages, then globally.
+    for p in pages_in_chunk:
+        ptext = page_texts.get(p, "")
+        if max_chars_per_page > 0:
+            ptext = ptext[:max_chars_per_page]
+        if quote_clean in ptext:
+            return p
+    for p in sorted(page_texts.keys()):
+        ptext = page_texts[p]
+        if max_chars_per_page > 0:
+            ptext = ptext[:max_chars_per_page]
+        if quote_clean in ptext:
+            return p
+
+    # 2) Normalized whitespace/case exact match.
+    nq = _normalize_for_quote_match(quote_clean)
+    if nq:
+        for p in pages_in_chunk:
+            ptext = page_texts.get(p, "")
+            if max_chars_per_page > 0:
+                ptext = ptext[:max_chars_per_page]
+            if nq in _normalize_for_quote_match(ptext):
+                return p
+        for p in sorted(page_texts.keys()):
+            ptext = page_texts[p]
+            if max_chars_per_page > 0:
+                ptext = ptext[:max_chars_per_page]
+            if nq in _normalize_for_quote_match(ptext):
+                return p
+
+    # 3) LLM may return clipped passages with "..." or "…": pick page
+    # with the most matching fragments.
+    frags = [
+        _normalize_for_quote_match(x)
+        for x in re.split(r"\.\.\.|…", quote_clean)
+        if _normalize_for_quote_match(x) and len(_normalize_for_quote_match(x)) >= 20
+    ]
+    if frags:
+        candidates = pages_in_chunk if pages_in_chunk else sorted(page_texts.keys())
+        best_page: int | None = None
+        best_score = 0
+        for p in candidates:
+            ptext = page_texts.get(p, "")
+            if max_chars_per_page > 0:
+                ptext = ptext[:max_chars_per_page]
+            np = _normalize_for_quote_match(ptext)
+            score = sum(1 for f in frags if f in np)
+            if score > best_score:
+                best_score = score
+                best_page = p
+        if best_page is not None and best_score > 0:
+            return best_page
+
+    return None
+
+
 class PDFReaderAgent(IChatBioAgent):
 
     def __init__(self):
@@ -586,21 +805,37 @@ class PDFReaderAgent(IChatBioAgent):
                             )
                         # await process.log(parse_msg, data=parse_data)
                         await process.log(parse_msg)
+                        await process.log(
+                            "Starting PDF text and structure extraction. This can take a while for large files."
+                        )
 
                         pdf_pipeline_start = time.perf_counter()
                         pymupdf4llm_start_time = time.perf_counter()
 
-                        (
-                            elements,
-                            text_length,
-                            page_table_csv,
-                            embedded_images_by_page,
-                        ) = read_pdf_with_pymupdf4llm_json(
-                            pdf_path=downloaded_path,
-                            start_page=start_page,
-                            end_page=end_page_effective,
-                            max_pages=max_pages_effective
+                        stop_parse_heartbeat = asyncio.Event()
+                        parse_heartbeat_task = asyncio.create_task(
+                            _pdf_stage_loading_heartbeat(
+                                process,
+                                stop_parse_heartbeat,
+                                "Extracting PDF content with pymupdf4llm_json",
+                            )
                         )
+                        try:
+                            (
+                                elements,
+                                text_length,
+                                page_table_csv,
+                                embedded_images_by_page,
+                            ) = await asyncio.to_thread(
+                                read_pdf_with_pymupdf4llm_json,
+                                downloaded_path,
+                                start_page,
+                                end_page_effective,
+                                max_pages_effective,
+                            )
+                        finally:
+                            stop_parse_heartbeat.set()
+                            await parse_heartbeat_task
 
                         extraction_time = time.perf_counter() - pymupdf4llm_start_time
                         await process.log(
@@ -676,7 +911,11 @@ class PDFReaderAgent(IChatBioAgent):
 
                         quote_findings: list[dict] = []
                         quote_extract_start = time.perf_counter()
-                        quote_findings, fuzzy_search_seconds = await self._extract_quotes_from_structured_blocks(
+                        (
+                            quote_findings,
+                            fuzzy_search_seconds,
+                            quote_extraction_stats,
+                        ) = await self._extract_quotes_from_structured_blocks(
                             process=process,
                             request=request,
                             structured_blocks=structured_blocks,
@@ -720,6 +959,7 @@ class PDFReaderAgent(IChatBioAgent):
                             "text_length": text_length,
                             "strategy": strategy,
                             "quote_findings": quote_findings,
+                            "quote_extraction_stats": quote_extraction_stats,
                             "table_count": table_extraction.get("table_count", 0),
                             "table_files": table_extraction.get("table_files", []),
                             "table_output_dir": table_extraction.get("output_dir", ""),
@@ -763,6 +1003,7 @@ class PDFReaderAgent(IChatBioAgent):
                             )
                             max_fig_art = PDF_FIGURE_ARTIFACT_MAX_PER_PAGE
                             art_i = 0
+                            seen_image_hashes: set[str] = set()
                             for page_num in fig_pages:
                                 candidate_images = _collect_figure_embedded_images(
                                     images_by_page_art,
@@ -776,6 +1017,13 @@ class PDFReaderAgent(IChatBioAgent):
                                     b64 = str(embedded.get("base64") or "").strip()
                                     if not b64:
                                         continue
+                                    # Neighbor-page collection can overlap across
+                                    # multiple figure-relevant pages; dedupe by
+                                    # image content so identical figures are not
+                                    # emitted as separate artifacts.
+                                    fp = hashlib.sha256(b64.encode("ascii", "ignore")).hexdigest()
+                                    if fp in seen_image_hashes:
+                                        continue
                                     mime = str(embedded.get("mime") or "image/png").strip()
                                     if not mime.startswith("image/"):
                                         mime = "image/png"
@@ -785,11 +1033,13 @@ class PDFReaderAgent(IChatBioAgent):
                                         continue
                                     if not image_bytes:
                                         continue
+                                    seen_image_hashes.add(fp)
                                     art_i += 1
-                                    fig_desc = (
-                                        f"Figure image (page {page_num}, backed by quote "
-                                        f"finding, source=pymupdf4llm_json_embed): #{art_i}"
-                                    )
+                                    # fig_desc = (
+                                    #     f"Figure image (page {page_num}, backed by quote "
+                                    #     f"finding, source=pymupdf4llm_json_embed): #{art_i}"
+                                    # )
+                                    fig_desc = (f"Figure image (page {page_num}, backed by quote finding)")
                                     await process.create_artifact(
                                         mimetype=mime,
                                         description=fig_desc,
@@ -905,7 +1155,27 @@ class PDFReaderAgent(IChatBioAgent):
                             summary += "  - Inferred conclusion:\n"
                             summary += f"    {conclusion}\n"
                         quote_findings = result.get("quote_findings") or []
+                        quote_extraction_stats = result.get("quote_extraction_stats") or {}
                         summary += f"  - Quote findings: {len(quote_findings)}\n"
+                        summary += (
+                            "  - Chunks sent to LLM for quote extraction: "
+                            f"{quote_extraction_stats.get('chunks_sent_to_llm', 0)}\n"
+                        )
+                        if quote_extraction_stats.get("fuzzy_search_enabled") is True:
+                            page_scored = quote_extraction_stats.get("selected_pages_with_scores") or []
+                            summary += (
+                                "  - Fuzzy selected pages with scores:\n"
+                            )
+                            summary += (
+                                f"```json\n{json.dumps(page_scored, ensure_ascii=False, indent=2, default=str)}\n```\n"
+                            )
+                            scored = quote_extraction_stats.get("selected_chunks_with_scores") or []
+                            summary += (
+                                "  - Fuzzy selected chunks (sent to LLM) with scores:\n"
+                            )
+                            summary += (
+                                f"```json\n{json.dumps(scored, ensure_ascii=False, indent=2, default=str)}\n```\n"
+                            )
                         quote_payload: list[Any] = []
                         for qf in quote_findings:
                             if isinstance(qf, dict):
@@ -1275,206 +1545,18 @@ class PDFReaderAgent(IChatBioAgent):
                     out.append(s)
                     if len(out) >= PDF_QUOTES_QUERY_TERM_COUNT:
                         break
-            if req and req.lower() not in seen:
+            # Short phrases (<= 40 chars) can still fuzzy-match; long requests cannot (max edit ~3).
+            if req and len(req) <= 40 and req.lower() not in seen:
+                seen.add(req.lower())
                 out.append(req)
+            for tok in _retrieval_tokens_from_request(req, seen=seen, max_extra=24):
+                out.append(tok)
+            await process.log(f"Retrieval terms: {out}")
             return out
         except Exception as exc:
             await process.log(f"Term generation failed; using request fallback: {exc}")
-            return [req] if req else []
-
-    # async def _precompute_page_table_csvs(
-    #     self,
-    #     process: IChatBioAgentProcess,
-    #     pdf_path: str,
-    #     page_texts: dict[int, str],
-    #     span_first: int,
-    #     span_last: int,
-    #     request: str,
-    #     *,
-    #     saved_base_dir: str | None = None,
-    #     source_label: str = "pdf",
-    # ) -> dict[int, str]:
-    #     flag = PDF_TABLE_CSV_PRECOMPUTE.strip().lower()
-    #     if flag in ("0", "false", "no", "off"):
-    #         return {}
-    #     if not PYMUPDF_AVAILABLE:
-    #         return {}
-
-    #     model = PRECOMPUTE_TABLE_FIGURE_MODEL
-    #     timeout = OPENAI_PDF_TABLE_FIGURE_TIMEOUT
-    #     max_calls = PDF_TABLE_PRECOMPUTE_MAX_CALLS
-    #     max_page_text = PDF_TABLE_FIGURE_PAGE_TEXT_CHARS
-    #     render_max_side = PDF_TABLE_FIGURE_RENDER_MAX_SIDE
-
-    #     cue_table, _cue_fig = find_table_figure_cue_pages(page_texts)
-    #     table_word_pages = find_pages_with_table_word(page_texts)
-    #     span_pages = set(range(int(span_first), int(span_last) + 1))
-    #     extra = _extra_table_pages_for_user_request(request, page_texts, span_pages)
-    #     candidate_pages = sorted((cue_table | table_word_pages | extra) & span_pages)
-
-    #     create_art = PDF_TABLE_VISION_CREATE_ARTIFACTS.strip().lower() not in (
-    #         "0",
-    #         "false",
-    #         "no",
-    #         "off",
-    #     )
-    #     art_max = PDF_TABLE_VISION_ARTIFACT_MAX
-    #     art_n = 0
-    #     save_png = PDF_TABLE_SAVE_PAGE_PNG.strip().lower() in (
-    #         "1",
-    #         "true",
-    #         "yes",
-    #         "on",
-    #     )
-    #     save_dir: Path | None = None
-    #     if save_png and saved_base_dir:
-    #         save_dir = Path(saved_base_dir) / _safe_name(source_label, "pdf") / "table_vision"
-    #         save_dir.mkdir(parents=True, exist_ok=True)
-
-    #     sys_pre = (
-    #         "You see a full-page raster image of one PDF page (PyMuPDF) plus the same page's extracted plain text.\n"
-    #         "The page was chosen because its text likely refers to a table (caption or the word Table).\n"
-    #         "Transcribe any visible data table as CSV (comma-separated; header row when clear). "
-    #         "If there is no table in the image, return an empty tabular_csv string.\n"
-    #         "Do not invent cells; only transcribe what is visible.\n"
-    #         'Return ONLY JSON: {"tabular_csv": "<string>"}'
-    #     )
-
-    #     out: dict[int, str] = {}
-    #     calls = 0
-    #     client = OpenAI(timeout=timeout)
-    #     req_snip = (request or "").strip()[:500]
-    #     precompute_wall_start = time.perf_counter()
-    #     render_total_seconds = 0.0
-    #     llm_total_seconds = 0.0
-    #     llm_success_calls = 0
-    #     pages_with_csv = 0
-
-    #     for page in candidate_pages:
-    #         if calls >= max_calls:
-    #             break
-    #         page_start = time.perf_counter()
-    #         render_seconds = 0.0
-    #         try:
-    #             render_start = time.perf_counter()
-    #             png_bytes = render_pdf_page_to_png_bytes(
-    #                 pdf_path, page, max_side_px=render_max_side
-    #             )
-    #             render_seconds = time.perf_counter() - render_start
-    #             render_total_seconds += render_seconds
-    #         except Exception as exc:
-    #             await process.log(f"Table CSV precompute: page render failed (page {page}): {exc}")
-    #             continue
-    #         page_text = _truncate_for_vision_prompt(page_texts.get(page, ""), max_page_text)
-    #         b64_png = base64.b64encode(png_bytes).decode("ascii")
-    #         user_block = (
-    #             f"(Context) User request (may be vague): {req_snip}\n\n"
-    #             f"Page number (1-based): {page}\n\n"
-    #             f"Page text:\n{page_text}\n"
-    #         )
-    #         calls += 1
-    #         content = ""
-    #         llm_seconds = 0.0
-    #         try:
-    #             llm_start = time.perf_counter()
-    #             resp = client.chat.completions.create(
-    #                 model=model,
-    #                 messages=[
-    #                     {"role": "system", "content": sys_pre},
-    #                     {
-    #                         "role": "user",
-    #                         "content": [
-    #                             {"type": "text", "text": user_block},
-    #                             {
-    #                                 "type": "image_url",
-    #                                 "image_url": {"url": f"data:image/png;base64,{b64_png}"},
-    #                             },
-    #                         ],
-    #                     },
-    #                 ],
-    #                 temperature=0.0,
-    #             )
-    #             llm_seconds = time.perf_counter() - llm_start
-    #             llm_total_seconds += llm_seconds
-    #             llm_success_calls += 1
-    #             content = (resp.choices[0].message.content or "").strip()
-    #         except Exception as exc:
-    #             await process.log(f"Table CSV precompute LLM error page {page}: {exc}")
-    #             continue
-
-    #         if save_dir is not None:
-    #             try:
-    #                 (save_dir / f"page_{page:04d}_render.png").write_bytes(png_bytes)
-    #             except OSError as exc:
-    #                 await process.log(f"Table CSV precompute: failed to save PNG page {page}: {exc}")
-
-    #         parsed = _parse_json_object_from_response(content)
-    #         if not isinstance(parsed, dict):
-    #             continue
-    #         tab_csv = str(parsed.get("tabular_csv") or "").strip()
-    #         if tab_csv:
-    #             out[page] = tab_csv
-    #             pages_with_csv += 1
-
-    #     precompute_wall_seconds = time.perf_counter() - precompute_wall_start
-    #     if out:
-    #         await process.log(
-    #             f"Table CSV precompute: stored CSV for {len(out)} page(s).",
-    #             data={
-    #                 "model": model,
-    #                 "vision_calls": calls,
-    #                 "candidate_pages": len(candidate_pages),
-    #                 "table_vision_artifacts_created": art_n,
-    #                 "timing_seconds_total": round(precompute_wall_seconds, 4),
-    #                 "timing_seconds_render_total": round(render_total_seconds, 4),
-    #                 "timing_seconds_llm_total": round(llm_total_seconds, 4),
-    #                 "timing_seconds_render_avg": round(
-    #                     (render_total_seconds / calls), 4
-    #                 )
-    #                 if calls > 0
-    #                 else 0.0,
-    #                 "timing_seconds_llm_avg": round(
-    #                     (llm_total_seconds / llm_success_calls), 4
-    #                 )
-    #                 if llm_success_calls > 0
-    #                 else 0.0,
-    #                 "pages_with_csv": pages_with_csv,
-    #             },
-    #         )
-    #     elif calls > 0:
-    #         await process.log(
-    #             "Table CSV precompute: vision ran but no non-empty CSV returned.",
-    #             data={
-    #                 "model": model,
-    #                 "vision_calls": calls,
-    #                 "candidate_pages": len(candidate_pages),
-    #                 "timing_seconds_total": round(precompute_wall_seconds, 4),
-    #                 "timing_seconds_render_total": round(render_total_seconds, 4),
-    #                 "timing_seconds_llm_total": round(llm_total_seconds, 4),
-    #                 "timing_seconds_render_avg": round(
-    #                     (render_total_seconds / calls), 4
-    #                 )
-    #                 if calls > 0
-    #                 else 0.0,
-    #                 "timing_seconds_llm_avg": round(
-    #                     (llm_total_seconds / llm_success_calls), 4
-    #                 )
-    #                 if llm_success_calls > 0
-    #                 else 0.0,
-    #                 "pages_with_csv": pages_with_csv,
-    #             },
-    #         )
-    #     elif candidate_pages:
-    #         await process.log(
-    #             "Table CSV precompute: candidate pages found but no LLM calls were made.",
-    #             data={
-    #                 "model": model,
-    #                 "candidate_pages": len(candidate_pages),
-    #                 "max_calls": max_calls,
-    #                 "timing_seconds_total": round(precompute_wall_seconds, 4),
-    #             },
-    #         )
-    #     return out
+            fb = _retrieval_tokens_from_request(req, seen=set(), max_extra=24)
+            return fb if fb else ([req] if req else [])
 
     async def _extract_quotes_from_structured_blocks(
         self,
@@ -1489,11 +1571,11 @@ class PDFReaderAgent(IChatBioAgent):
         span_last: int | None = None,
         page_table_csv: dict[int, str] | None = None,
         embedded_images_by_page: dict[int, list[dict[str, str]]] | None = None,
-    ) -> tuple[list[dict], float]:
+    ) -> tuple[list[dict], float, dict[str, Any]]:
         req = (request or "").strip()
         if not req:
             await process.log("Quote extraction skipped: empty request.")
-            return [], 0.0
+            return [], 0.0, {}
 
         model_name = QUOTE_EXTRACTION_MODEL
 
@@ -1522,7 +1604,7 @@ class PDFReaderAgent(IChatBioAgent):
 
         if not page_texts:
             await process.log("No text pages available in structured_blocks for quote extraction.")
-            return [], 0.0
+            return [], 0.0, {}
 
         span_eff_first = (
             int(span_first) if span_first is not None else min(page_texts.keys())
@@ -1539,12 +1621,28 @@ class PDFReaderAgent(IChatBioAgent):
         chunked_quote_findings: list[dict] = []
         seen: set[tuple[str, int]] = set()
         max_chars_per_page = PDF_QUOTES_MAX_PAGE_CHARS
+        sorted_pages = sorted(page_texts.keys())
+        progress: dict[str, Any] = {
+            "stage": "Finding relevant information in PDF pages",
+            "current_page": None,
+            "pages_done": 0,
+            "pages_total": len(sorted_pages),
+            "chunks_done": 0,
+            "chunks_total": 0,
+        }
+        stop_heartbeat = asyncio.Event()
+        heartbeat_task = asyncio.create_task(
+            _quote_finding_loading_heartbeat(process, stop_heartbeat, progress)
+        )
 
         usage_prompt_tokens = 0
         usage_completion_tokens = 0
         usage_total_tokens = 0
         llm_request_count = 0
         fuzzy_search_seconds_total = 0.0
+        chunks_sent_to_llm = 0
+        fuzzy_chunk_scores_used: list[dict[str, Any]] = []
+        fuzzy_page_scores_used: list[dict[str, Any]] = []
 
         strategy = PDF_QUOTES_STRATEGY.strip().lower()
         client = OpenAI(timeout=OPENAI_PDF_QUOTES_TIMEOUT)
@@ -1602,11 +1700,14 @@ class PDFReaderAgent(IChatBioAgent):
 
         try:
             per_page_wall_start = time.perf_counter()
-            for page in sorted(page_texts.keys()):
+            for page in sorted_pages:
+                progress["stage"] = "Scanning extracted page text for quote anchors"
+                progress["current_page"] = page
                 page_text = page_texts[page]
                 if max_chars_per_page > 0:
                     page_text = page_text[:max_chars_per_page]
                 if not page_text.strip():
+                    progress["pages_done"] = int(progress.get("pages_done") or 0) + 1
                     continue
 
                 base_u = (
@@ -1630,38 +1731,126 @@ class PDFReaderAgent(IChatBioAgent):
                         continue
                     seen.add(key)
                     quote_findings.append({"quotes": passage, "page": page, "reason": ""})
+                progress["pages_done"] = int(progress.get("pages_done") or 0) + 1
 
             per_page_wall_seconds = time.perf_counter() - per_page_wall_start
 
             if strategy == "chunked":
                 chunk_size = PDF_QUOTES_CHUNK_CHARS
-                llm_chunks = split_page_texts_into_quote_llm_chunks(
-                    page_texts, max_chars_per_page, chunk_size
-                )
-                retrieval_terms = await self._generate_query_terms_with_llm(
-                    process, client, model_name, req
-                )
                 scored_chunks: list[tuple[float, int, dict[str, Any]]] = []
-                for ch_i, ch in enumerate(llm_chunks):
-                    chunk_body = ch.get("text") or ""
-                    score, fuzzy_seconds = self._score_chunk_by_terms(
-                        chunk_body, retrieval_terms
+                retrieval_terms: list[str] = []
+                page_texts_for_chunks: dict[int, str] = page_texts
+
+                page_score_lookup: dict[int, float] = {}
+                page_order_for_chunks: list[int] | None = None
+
+                if ENABLED_FUZZY_SEARCH:
+                    retrieval_terms = await self._generate_query_terms_with_llm(
+                        process, client, model_name, req
                     )
-                    fuzzy_search_seconds_total += fuzzy_seconds
-                    scored_chunks.append((score, ch_i, ch))
-                if any(s > 0 for s, _, _ in scored_chunks):
-                    scored_chunks.sort(key=lambda row: (-row[0], row[1]))
+                    # Phase 1: fuzzy-score each page, sort by score (desc), then chunk in that order.
+                    scored_pages: list[tuple[float, int]] = []
+                    for p in sorted_pages:
+                        pt = page_texts.get(p, "")
+                        if max_chars_per_page > 0:
+                            pt = pt[:max_chars_per_page]
+                        score, fuzzy_seconds = self._score_chunk_by_terms(
+                            pt, retrieval_terms
+                        )
+                        fuzzy_search_seconds_total += fuzzy_seconds
+                        scored_pages.append((score, p))
+                    scored_pages.sort(key=lambda row: (-row[0], row[1]))
+                    for s, p in scored_pages:
+                        page_score_lookup[p] = float(s)
+                    # Always log the top pages by rank (even when all scores are 0).
+                    fuzzy_page_scores_used = [
+                        {"page": p, "score": round(s, 6)}
+                        for s, p in scored_pages[:PDF_QUOTES_TOP_SCORING_PAGES]
+                    ]
+                    if ENABLED_EXHAUSTIVE_SEARCH:
+                        # Exhaustive mode: keep all pages that have at least one
+                        # "hit" by fuzzy scoring, ordered by score (desc).
+                        chosen_pages = [
+                            p
+                            for s, p in scored_pages
+                            if float(s) >= 1.0
+                        ][:PDF_QUOTES_TOP_SCORING_PAGES]
+                        if chosen_pages:
+                            page_order_for_chunks = chosen_pages
+                            page_texts_for_chunks = {
+                                p: page_texts[p] for p in page_order_for_chunks
+                            }
+                        else:
+                            # If no page reaches the threshold, fall back to legacy
+                            # behavior: chunk the full PDF in natural page order.
+                            page_texts_for_chunks = page_texts
+                            page_order_for_chunks = None
+                    else:
+                        best_page_score = scored_pages[0][0] if scored_pages else 0.0
+                        if best_page_score > 0.0:
+                            chosen = scored_pages[:PDF_QUOTES_TOP_SCORING_PAGES]
+                            page_order_for_chunks = [p for _s, p in chosen]
+                            page_texts_for_chunks = {
+                                p: page_texts[p] for p in page_order_for_chunks
+                            }
+                        else:
+                            # No term hits: chunk the full PDF in natural page order (legacy behavior).
+                            page_texts_for_chunks = page_texts
+                            page_order_for_chunks = None
+
+                llm_chunks = split_page_texts_into_quote_llm_chunks(
+                    page_texts_for_chunks,
+                    max_chars_per_page,
+                    chunk_size,
+                    page_iteration_order=page_order_for_chunks,
+                )
+                progress["chunks_total"] = len(llm_chunks)
+
+                if ENABLED_FUZZY_SEARCH:
+                    # Chunks are already ordered by page relevance; take the first K and
+                    # attach scores as the sum of constituent page fuzzy scores.
+                    chunks_for_scoring = (
+                        llm_chunks
+                        if ENABLED_EXHAUSTIVE_SEARCH
+                        else llm_chunks[:PDF_QUOTES_TOP_SCORING_CHUNKS]
+                    )
+                    for ch_i, ch in enumerate(chunks_for_scoring):
+                        pages_in = [
+                            int(p)
+                            for p in (ch.get("pages") or [])
+                            if isinstance(p, int)
+                        ]
+                        agg = sum(page_score_lookup.get(p, 0.0) for p in pages_in)
+                        scored_chunks.append((agg, ch_i, ch))
+                        fuzzy_chunk_scores_used.append(
+                            {
+                                "chunk_index": ch_i + 1,
+                                "score": round(agg, 6),
+                                "pages": ch.get("pages") or [],
+                            }
+                        )
                 else:
-                    scored_chunks.sort(key=lambda row: row[1])
+                    scored_chunks = [(1.0, ch_i, ch) for ch_i, ch in enumerate(llm_chunks)]
 
                 await process.log(
                     "Chunk retrieval ranking prepared",
                     data={
+                        "fuzzy_search_enabled": ENABLED_FUZZY_SEARCH,
+                        "page_first_fuzzy": ENABLED_FUZZY_SEARCH,
+                        "top_scoring_pages_limit": PDF_QUOTES_TOP_SCORING_PAGES,
                         "chunk_count": len(llm_chunks),
+                        "chunks_selected_for_llm": len(scored_chunks),
                         "retrieval_terms_count": len(retrieval_terms),
                         "fuzzy_search_seconds": round(fuzzy_search_seconds_total, 4),
                         "max_pages_to_search": PDF_QUOTES_MAX_SEARCH_PAGES,
                         "batch_size": PDF_QUOTES_LLM_BATCH_SIZE,
+                        "top_scoring_chunks_limit": PDF_QUOTES_TOP_SCORING_CHUNKS,
+                        "selected_pages_with_scores": (
+                            fuzzy_page_scores_used if ENABLED_FUZZY_SEARCH else []
+                        ),
+                        "selected_chunks_with_scores": (
+                            fuzzy_chunk_scores_used if ENABLED_FUZZY_SEARCH else []
+                        ),
                     },
                 )
 
@@ -1669,6 +1858,7 @@ class PDFReaderAgent(IChatBioAgent):
                 pages_searched: set[int] = set()
                 ranked_cursor = 0
                 while ranked_cursor < len(scored_chunks):
+                    progress["stage"] = "Finding quotes with chunked PDF search"
                     batch_rows: list[tuple[float, int, dict[str, Any]]] = []
                     while (
                         ranked_cursor < len(scored_chunks)
@@ -1677,9 +1867,10 @@ class PDFReaderAgent(IChatBioAgent):
                         row = scored_chunks[ranked_cursor]
                         ranked_cursor += 1
                         ch_pages = [int(p) for p in (row[2].get("pages") or []) if isinstance(p, int)]
-                        merged = pages_searched | set(ch_pages)
-                        if ch_pages and len(merged) > PDF_QUOTES_MAX_SEARCH_PAGES:
-                            continue
+                        if ENABLED_FUZZY_SEARCH:
+                            merged = pages_searched | set(ch_pages)
+                            if ch_pages and len(merged) > PDF_QUOTES_MAX_SEARCH_PAGES:
+                                continue
                         batch_rows.append(row)
                     if not batch_rows:
                         break
@@ -1687,6 +1878,7 @@ class PDFReaderAgent(IChatBioAgent):
                         for p in (ch.get("pages") or []):
                             if isinstance(p, int):
                                 pages_searched.add(p)
+                                progress["current_page"] = p
 
                     async def _query_chunk(chunk_row: tuple[float, int, dict[str, Any]]) -> dict[str, Any] | None:
                         _score, ch_i, ch = chunk_row
@@ -1732,6 +1924,8 @@ class PDFReaderAgent(IChatBioAgent):
                     batch_results = await asyncio.gather(
                         *[_query_chunk(row) for row in batch_rows]
                     )
+                    progress["chunks_done"] = int(progress.get("chunks_done") or 0) + len(batch_rows)
+                    chunks_sent_to_llm += len([r for r in batch_results if r is not None])
                     llm_request_count += len([r for r in batch_results if r is not None])
                     for row in batch_results:
                         if row is None:
@@ -1784,29 +1978,15 @@ class PDFReaderAgent(IChatBioAgent):
                                 had_t_csv,
                             ):
                                 continue
-                            resolved_page: int | None = None
-                            for p in pages_in_chunk:
-                                ptext = page_texts.get(p, "")
-                                if max_chars_per_page > 0:
-                                    ptext = ptext[:max_chars_per_page]
-                                if quote_clean in ptext:
-                                    resolved_page = p
-                                    break
+                            resolved_page = _resolve_quote_page(
+                                quote_clean,
+                                pages_in_chunk,
+                                page_texts,
+                                max_chars_per_page,
+                            )
+                            # Never assign an arbitrary page when mapping failed.
                             if resolved_page is None:
-                                for p in sorted(page_texts.keys()):
-                                    ptext = page_texts[p]
-                                    if max_chars_per_page > 0:
-                                        ptext = ptext[:max_chars_per_page]
-                                    if quote_clean in ptext:
-                                        resolved_page = p
-                                        break
-                            if resolved_page is None:
-                                if pages_in_chunk:
-                                    resolved_page = pages_in_chunk[0]
-                                elif page_texts:
-                                    resolved_page = min(page_texts.keys())
-                                else:
-                                    continue
+                                continue
                             ck = (quote_clean, resolved_page)
                             if ck in seen:
                                 continue
@@ -1826,7 +2006,7 @@ class PDFReaderAgent(IChatBioAgent):
                             ):
                                 row_c["figure_relevant"] = True
                             quote_findings.append(row_c)
-                    if quote_findings:
+                    if ENABLED_FUZZY_SEARCH and quote_findings:
                         break
                 chunked_wall = time.perf_counter() - t_chunked
                 await process.log(
@@ -1835,6 +2015,7 @@ class PDFReaderAgent(IChatBioAgent):
                         "model": model_name,
                         "llm_requests": llm_request_count,
                         "chunk_count": len(llm_chunks),
+                        "chunks_sent_to_llm": chunks_sent_to_llm,
                         "pages_searched": len(pages_searched),
                         "wall_seconds_chunked_llm": round(chunked_wall, 4),
                         "quotes_found_count": len(quote_findings),
@@ -1884,10 +2065,26 @@ class PDFReaderAgent(IChatBioAgent):
                     data={"model": model_name},
                 )
 
-            return quote_findings, fuzzy_search_seconds_total
+            extraction_stats: dict[str, Any] = {
+                "fuzzy_search_enabled": ENABLED_FUZZY_SEARCH,
+                "chunks_sent_to_llm": chunks_sent_to_llm,
+                "selected_chunk_count": len(fuzzy_chunk_scores_used)
+                if ENABLED_FUZZY_SEARCH
+                else chunks_sent_to_llm,
+                "selected_chunks_with_scores": (
+                    fuzzy_chunk_scores_used if ENABLED_FUZZY_SEARCH else []
+                ),
+                "selected_pages_with_scores": (
+                    fuzzy_page_scores_used if ENABLED_FUZZY_SEARCH else []
+                ),
+            }
+            return quote_findings, fuzzy_search_seconds_total, extraction_stats
         except Exception as e:
             await process.log(f"Warning: Quote extraction failed: {str(e)}", data={"model": model_name})
-            return [], 0.0
+            return [], 0.0, {}
+        finally:
+            stop_heartbeat.set()
+            await heartbeat_task
 
 def create_app() -> Starlette:
     agent = PDFReaderAgent()

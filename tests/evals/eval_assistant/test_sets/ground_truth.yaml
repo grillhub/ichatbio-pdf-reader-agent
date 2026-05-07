@@ -1,0 +1,33 @@
+test_cases:
+  # - artifact: Knorrn 2026.pdf
+  #   user_message: Please find Callista floridella identification
+  #   expected: >-
+  #     Callista floridella identification information found in the PDF that is Shell trigonal ovate in outline. Outer surface with narrow regular concentric grooves posteriorly.
+
+# Quote findings detail at least one quote found for Callista floridella identification information found in the PDF that is Shell trigonal ovate in outline. Outer surface with narrow regular concentric grooves posteriorly.
+
+  - artifact: Knorrn 2026.pdf
+    user_message: How many species were identified in this research?
+    expected:
+      - page: 1
+        sentence: "A total of 103 living marine macrozoobenthic invertebrate species were found."
+      - page: 49
+        sentence: "Within this study, 103 different living macrozoobenthic species from the northern Mauritanian coastal habitats were observed."
+
+  - artifact: Knorrn 2026.pdf
+    user_message: What sampling methods were used to collect species?
+    expected:
+      - page: 5
+        sentence: "Sampling methods included hand collection, fish traps, beach seine, beam trawl, and dredge."
+
+  - artifact: Knorrn 2026.pdf
+    user_message: What years were the expeditions conducted?
+    expected:
+      - page: 5
+        sentence: "five expeditions conducted between 2020 and 2024 by the Institut Mauritanien"
+
+  - artifact: Knorrn 2026.pdf
+    user_message: What habitats were studied in this research?
+    expected:
+      - page: 2
+        sentence: "This study aims to provide an overview of the coastal shallow-water habitats of Mauritania, including seagrass beds, maerl beds, and tidal mudflats, and to catalogue the most abundant macrozoobenthic invertebrate species present in this environment additionally highlighting their most outstanding morphological characteristics."

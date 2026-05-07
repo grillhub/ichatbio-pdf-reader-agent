@@ -109,6 +109,9 @@ def split_page_texts_into_quote_llm_chunks(
     page_texts: dict[int, str],
     max_chars_per_page: int,
     max_chars_per_chunk: int,
+    *,
+    page_iteration_order: list[int] | None = None,
+    preserve_page_boundaries: bool = True,
 ) -> list[dict[str, Any]]:
     min_chunk = 2000
     if max_chars_per_chunk < min_chunk:
@@ -129,7 +132,10 @@ def split_page_texts_into_quote_llm_chunks(
             i -= 1
         return i >= 0 and trimmed[i] == "."
 
-    page_order = sorted(page_texts.keys())
+    if page_iteration_order is not None:
+        page_order = [p for p in page_iteration_order if p in page_texts]
+    else:
+        page_order = sorted(page_texts.keys())
     effective_page_texts: dict[int, str] = {}
     for p in page_order:
         pt = page_texts[p]
@@ -137,30 +143,34 @@ def split_page_texts_into_quote_llm_chunks(
             pt = pt[:max_chars_per_page]
         effective_page_texts[p] = pt if isinstance(pt, str) else ""
 
-    for idx, p in enumerate(page_order[:-1]):
-        current = effective_page_texts.get(p, "")
-        if not current.strip() or _ends_with_full_stop(current):
-            continue
-
-        j = idx + 1
-        while j < len(page_order):
-            next_page = page_order[j]
-            next_text = effective_page_texts.get(next_page, "")
-            if not next_text.strip():
-                j += 1
+    # Keep each page text isolated by default so downstream quote->page attribution
+    # remains stable. Cross-page borrowing can improve sentence continuity, but it
+    # can also mis-assign quotes to the wrong page number.
+    if (not preserve_page_boundaries) and page_iteration_order is None:
+        for idx, p in enumerate(page_order[:-1]):
+            current = effective_page_texts.get(p, "")
+            if not current.strip() or _ends_with_full_stop(current):
                 continue
 
-            stop_idx = next_text.find(".")
-            if stop_idx >= 0:
-                borrowed = next_text[: stop_idx + 1]
-                effective_page_texts[p] = current.rstrip() + " " + borrowed.lstrip()
-                effective_page_texts[next_page] = next_text[stop_idx + 1 :].lstrip()
-                break
+            j = idx + 1
+            while j < len(page_order):
+                next_page = page_order[j]
+                next_text = effective_page_texts.get(next_page, "")
+                if not next_text.strip():
+                    j += 1
+                    continue
 
-            effective_page_texts[p] = current.rstrip() + " " + next_text.strip()
-            effective_page_texts[next_page] = ""
-            current = effective_page_texts[p]
-            j += 1
+                stop_idx = next_text.find(".")
+                if stop_idx >= 0:
+                    borrowed = next_text[: stop_idx + 1]
+                    effective_page_texts[p] = current.rstrip() + " " + borrowed.lstrip()
+                    effective_page_texts[next_page] = next_text[stop_idx + 1 :].lstrip()
+                    break
+
+                effective_page_texts[p] = current.rstrip() + " " + next_text.strip()
+                effective_page_texts[next_page] = ""
+                current = effective_page_texts[p]
+                j += 1
 
     chunks: list[dict[str, Any]] = []
     parts: list[str] = []
