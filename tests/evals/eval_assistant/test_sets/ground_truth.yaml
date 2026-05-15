@@ -29,5 +29,13 @@ test_cases:
   - artifact: Knorrn 2026.pdf
     user_message: What habitats were studied in this research?
     expected:
+      - page: 4
+        sentence: "Overview of the studied habitats in Mauritania. A. Underwater image of the maerl ecosystem at the Baie de l’Étoile; B.Nanozostera noltei bed in the Baie de l’Étoile; C. The old pier at the “Centre de Pêche”, Baie de l’Étoile; D. Hard substrate of the rocky island in the Baie de l’Étoile; E. Artisanal fisheries landing place at the Baie de l’Étoile; F. Rocky shoreline at Cap Blanc; G.Leptogorgia-forest from the submerged ridge field; H. Sandstone tidepools at Pelican island in front of the Bellaat lagoon entrance; I. Sandy beach at the Blaouakh village; J. Sandy beach area at Agadir with great abundances of alive Senilia senilis."
       - page: 2
         sentence: "This study aims to provide an overview of the coastal shallow-water habitats of Mauritania, including seagrass beds, maerl beds, and tidal mudflats, and to catalogue the most abundant macrozoobenthic invertebrate species present in this environment additionally highlighting their most outstanding morphological characteristics."
+      - page: 5
+        sentence: "The seagrass beds around Kijji island are located along a sandy area and rooted within an old oyster shell bed. Hard substrate habitats were investigated along the rocky shores of Cap Blanc, the sandstone tide pools of Pelican island (Fig. 2H) in front of the Bellaat lagoon entrance, the rocky shoreline at Cansado, an old stone pier at Agadir and the rocky island in the Baie de l’Étoile. The submerged ridge field off the Cap Sainte Anne coastal plain with its octocoral forest habitats was additionally investigated (Fig. 2G)."
+        
+  # - artifact: Knorrn 2026.pdf
+  #   user_message: read and find how to convert ifc
+  #   expected: Quote findings is zero
