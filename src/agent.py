@@ -36,6 +36,7 @@ from .pdf_reader import (
     find_table_figure_cue_pages,
     find_pages_with_table_word,
     render_pdf_page_to_png_bytes,
+    search_pdf_pages_by_terms,
     _safe_name,
 )
 
@@ -44,6 +45,7 @@ from .utils.tools import (
     quote_chunk_llm_user_message_for_artifact,
     split_page_texts_into_quote_llm_chunks,
 )
+from .utils.token_chunking import prepare_pdf_page_texts_token_chunks_for_llm
 
 
 LOCALHOST_REPLACEMENT_HOST = os.getenv("LOCALHOST_REPLACEMENT_HOST")
@@ -58,15 +60,42 @@ QUOTE_EXTRACTION_MODEL = "gpt-oss-120b"
 # QUOTE_EXTRACTION_MODEL = "gpt-4o-mini"
 OPENAI_PDF_QUOTES_TIMEOUT = 120
 PDF_QUOTES_MAX_PAGE_CHARS = 40000
-PDF_QUOTES_STRATEGY = "chunked"
+# PDF_QUOTES_STRATEGY = "chunked"
+PDF_QUOTES_STRATEGY = "chunked_tokens"
 PDF_QUOTES_CHUNK_CHARS = 12000
+# Token overlap chunking (``PDF_QUOTES_STRATEGY="chunked_tokens"``); tiktoken model defaults to gpt-4o-mini.
+PDF_QUOTES_CHUNK_SIZE_TOKENS = 1000
+PDF_QUOTES_CHUNK_OVERLAP_TOKENS = 120
+PDF_QUOTES_TIKTOKEN_MODEL = "gpt-4o-mini"
+PDF_QUOTES_EST_OUTPUT_TOKENS_PER_CHUNK = 500
+# Default USD / 1M tokens for cost hints (gpt-4o-mini–class); override for your model.
+PDF_QUOTES_EST_INPUT_PRICE_PER_1M = 0.15
+PDF_QUOTES_EST_OUTPUT_PRICE_PER_1M = 0.60
+
 PDF_QUOTES_LLM_BATCH_SIZE = 5
 PDF_QUOTES_MAX_SEARCH_PAGES = 20
 PDF_QUOTES_QUERY_TERM_COUNT = 16
 PDF_QUOTES_TOP_SCORING_CHUNKS = 5
 PDF_QUOTES_TOP_SCORING_PAGES = 10
 ENABLED_FUZZY_SEARCH = True
-ENABLED_EXHAUSTIVE_SEARCH = True
+
+# PDF_QUOTES_REGEN_TERMS_ON_EMPTY_MISS = os.getenv(
+#     "PDF_QUOTES_REGEN_TERMS_ON_EMPTY_MISS", ""
+# ).strip().lower() in ("1", "true", "yes", "on")
+PDF_QUOTES_QUERY_TERM_REGEN_MAX_ATTEMPTS = 3
+PDF_PAGE_PREFILTER_ENABLED = True
+PDF_PAGE_PREFILTER_NEIGHBOR_RADIUS = 1
+# Interval for long-running PDF stage heartbeats (prefilter, parse, etc.).
+PDF_STAGE_LOADING_HEARTBEAT_INTERVAL_S = 60.0
+# When keyword prefilter returns more pages than this, extract in chunks of this
+# size for quote discovery; advance to the next chunk until a quote with LLM
+# ``reason`` is found or all prefilter pages are exhausted.
+PDF_PAGE_PREFILTER_QUOTE_SCAN_BATCH_SIZE = 100
+# When the extraction span is wider than this many PDF pages, keyword prefilter
+# runs on successive document windows (1–100, 101–200, …). After the last
+# window with no LLM quote, terms are regenerated and scanning restarts at page
+# 1, up to ``PDF_QUOTES_QUERY_TERM_REGEN_MAX_ATTEMPTS`` term rounds.
+PDF_PAGE_PREFILTER_DOCUMENT_WINDOW_PAGES = 100
 
 DESCRIPTION = """\
 This agent can read and extract information from PDF documents. It:
@@ -811,6 +840,429 @@ class PDFReaderAgent(IChatBioAgent):
 
                         pdf_pipeline_start = time.perf_counter()
                         pymupdf4llm_start_time = time.perf_counter()
+                        selected_pages_for_extract: list[int] | None = None
+                        prefilter_terms: list[str] = []
+                        windowed_prefilter_quote_hit = False
+                        used_document_window_prefilter = False
+                        skip_default_quote_loop = False
+                        quote_findings: list[dict] = []
+                        fuzzy_search_seconds = 0.0
+                        quote_extraction_seconds = 0.0
+                        quote_extraction_stats: dict[str, Any] = {}
+                        quote_extraction_run_count = 0
+                        structured_blocks: list[dict] = []
+                        elements: list[Any] | None = None
+
+                        if PDF_PAGE_PREFILTER_ENABLED and span_first <= span_last:
+                            req = (request or "").strip()
+                            prefilter_terms = await self._generate_query_terms_with_llm(
+                                process=process,
+                                client=OpenAI(timeout=OPENAI_PDF_QUOTES_TIMEOUT),
+                                model_name=QUOTE_EXTRACTION_MODEL,
+                                request=req,
+                            )
+
+                            if prefilter_terms:
+                                prefilter_start = time.perf_counter()
+                                stop_prefilter_heartbeat = asyncio.Event()
+                                prefilter_heartbeat_task = asyncio.create_task(
+                                    _pdf_stage_loading_heartbeat(
+                                        process,
+                                        stop_prefilter_heartbeat,
+                                        "PDF page prefilter (scanning pages for retrieval terms)",
+                                        PDF_STAGE_LOADING_HEARTBEAT_INTERVAL_S,
+                                    )
+                                )
+                                try:
+                                    doc_span_pages = span_last - span_first + 1
+                                    use_document_window_prefilter = (
+                                        doc_span_pages
+                                        > PDF_PAGE_PREFILTER_DOCUMENT_WINDOW_PAGES
+                                    )
+                                    if use_document_window_prefilter:
+                                        used_document_window_prefilter = True
+                                        term_regen_client = OpenAI(
+                                            timeout=OPENAI_PDF_QUOTES_TIMEOUT
+                                        )
+                                        used_term_keys: set[str] = {
+                                            str(t).strip().lower()
+                                            for t in prefilter_terms
+                                            if str(t).strip()
+                                        }
+                                        current_terms: list[str] = list(prefilter_terms)
+                                        extraction_time_windowed = 0.0
+                                        fuzzy_acc = 0.0
+                                        quote_sec_acc = 0.0
+                                        quote_runs_acc = 0
+                                        for term_round in range(
+                                            PDF_QUOTES_QUERY_TERM_REGEN_MAX_ATTEMPTS
+                                        ):
+                                            prefilter_terms = list(current_terms)
+                                            for w_lo in range(
+                                                span_first,
+                                                span_last + 1,
+                                                PDF_PAGE_PREFILTER_DOCUMENT_WINDOW_PAGES,
+                                            ):
+                                                w_hi = min(
+                                                    w_lo
+                                                    + PDF_PAGE_PREFILTER_DOCUMENT_WINDOW_PAGES
+                                                    - 1,
+                                                    span_last,
+                                                )
+                                                await process.log(
+                                                    "PDF page prefilter starting",
+                                                    data={
+                                                        "prefilter_terms_count": len(
+                                                            current_terms
+                                                        ),
+                                                        "prefilter_page_span_first": w_lo,
+                                                        "prefilter_page_span_last": w_hi,
+                                                        "prefilter_neighbor_radius": (
+                                                            PDF_PAGE_PREFILTER_NEIGHBOR_RADIUS
+                                                        ),
+                                                        "progress_heartbeat_interval_s": (
+                                                            PDF_STAGE_LOADING_HEARTBEAT_INTERVAL_S
+                                                        ),
+                                                        "prefilter_term_round": term_round,
+                                                    },
+                                                )
+                                                win_t0 = time.perf_counter()
+                                                sel = await asyncio.to_thread(
+                                                    search_pdf_pages_by_terms,
+                                                    downloaded_path,
+                                                    current_terms,
+                                                    start_page=w_lo,
+                                                    end_page=w_hi,
+                                                    max_pages=None,
+                                                    include_neighbor_radius=(
+                                                        PDF_PAGE_PREFILTER_NEIGHBOR_RADIUS
+                                                    ),
+                                                )
+                                                await process.log(
+                                                    "PDF page prefilter window complete",
+                                                    data={
+                                                        "prefilter_page_span_first": w_lo,
+                                                        "prefilter_page_span_last": w_hi,
+                                                        "prefilter_selected_pages_count": len(
+                                                            sel or []
+                                                        ),
+                                                        "prefilter_selected_pages": sel or [],
+                                                        "prefilter_window_seconds": round(
+                                                            time.perf_counter() - win_t0,
+                                                            4,
+                                                        ),
+                                                        "prefilter_term_round": term_round,
+                                                    },
+                                                )
+                                                if not sel:
+                                                    continue
+                                                sel_sorted = sorted(
+                                                    {
+                                                        int(p)
+                                                        for p in sel
+                                                        if isinstance(p, int) and int(p) >= 1
+                                                    }
+                                                )
+                                                if not sel_sorted:
+                                                    continue
+                                                hit = False
+                                                for bs in range(
+                                                    0,
+                                                    len(sel_sorted),
+                                                    PDF_PAGE_PREFILTER_QUOTE_SCAN_BATCH_SIZE,
+                                                ):
+                                                    batch_pages = sel_sorted[
+                                                        bs : bs
+                                                        + PDF_PAGE_PREFILTER_QUOTE_SCAN_BATCH_SIZE
+                                                    ]
+                                                    bt0 = time.perf_counter()
+                                                    el_b, tl_b, ptc_b, emb_b = (
+                                                        await asyncio.to_thread(
+                                                            read_pdf_with_pymupdf4llm_json,
+                                                            downloaded_path,
+                                                            start_page,
+                                                            end_page_effective,
+                                                            max_pages_effective,
+                                                            batch_pages,
+                                                        )
+                                                    )
+                                                    extraction_time_windowed += (
+                                                        time.perf_counter() - bt0
+                                                    )
+                                                    if not el_b:
+                                                        continue
+                                                    emb_grp = _embedded_images_grouped_by_page(
+                                                        emb_b
+                                                    )
+                                                    structured_blocks_b = (
+                                                        self._prepare_structured_blocks_from_elements(
+                                                            el_b, library
+                                                        )
+                                                    )
+                                                    ext_first_b = min(batch_pages)
+                                                    ext_last_b = max(batch_pages)
+                                                    qts = time.perf_counter()
+                                                    qf, fz, qs = (
+                                                        await self._extract_quotes_from_structured_blocks(
+                                                            process=process,
+                                                            request=request,
+                                                            structured_blocks=structured_blocks_b,
+                                                            source_library=library,
+                                                            source_url=pdf_url,
+                                                            retrieval_terms=current_terms,
+                                                            pdf_path=downloaded_path,
+                                                            span_first=ext_first_b,
+                                                            span_last=ext_last_b,
+                                                            page_table_csv=ptc_b or {},
+                                                            embedded_images_by_page=emb_grp,
+                                                        )
+                                                    )
+                                                    fuzzy_acc += float(fz)
+                                                    quote_sec_acc += (
+                                                        time.perf_counter() - qts
+                                                    )
+                                                    quote_runs_acc += 1
+                                                    if self._quote_findings_have_llm_reason(
+                                                        qf
+                                                    ):
+                                                        windowed_prefilter_quote_hit = True
+                                                        selected_pages_for_extract = (
+                                                            sel_sorted
+                                                        )
+                                                        elements = el_b
+                                                        text_length = tl_b
+                                                        page_table_csv = ptc_b or {}
+                                                        embedded_images_by_page = emb_grp
+                                                        structured_blocks = (
+                                                            structured_blocks_b
+                                                        )
+                                                        quote_findings = qf
+                                                        quote_extraction_stats = qs
+                                                        fuzzy_search_seconds = fuzzy_acc
+                                                        quote_extraction_seconds = (
+                                                            quote_sec_acc
+                                                        )
+                                                        quote_extraction_run_count = (
+                                                            quote_runs_acc
+                                                        )
+                                                        extract_first_effective = ext_first_b
+                                                        extract_last_effective = ext_last_b
+                                                        extraction_time = (
+                                                            extraction_time_windowed
+                                                        )
+                                                        skip_default_quote_loop = True
+                                                        hit = True
+                                                        break
+                                                if hit:
+                                                    break
+                                            if windowed_prefilter_quote_hit:
+                                                break
+                                            if (
+                                                term_round + 1
+                                                >= PDF_QUOTES_QUERY_TERM_REGEN_MAX_ATTEMPTS
+                                            ):
+                                                break
+                                            new_terms = await self._generate_query_terms_with_llm(
+                                                process=process,
+                                                client=term_regen_client,
+                                                model_name=QUOTE_EXTRACTION_MODEL,
+                                                request=request,
+                                                already_used_terms=sorted(used_term_keys),
+                                            )
+                                            if not new_terms:
+                                                await process.log(
+                                                    "Prefilter term regeneration returned no new terms; "
+                                                    "stopping document re-scan."
+                                                )
+                                                break
+                                            for t in new_terms:
+                                                lk = str(t).strip().lower()
+                                                if lk:
+                                                    used_term_keys.add(lk)
+                                            current_terms = new_terms
+                                            await process.log(
+                                                "Regenerated retrieval terms for PDF prefilter; "
+                                                "re-scanning from first document window",
+                                                data={"terms": new_terms},
+                                            )
+                                        prefilter_seconds = (
+                                            time.perf_counter() - prefilter_start
+                                        )
+                                        await process.log(
+                                            "PDF page prefilter pipeline complete",
+                                            data={
+                                                "prefilter_seconds": round(
+                                                    prefilter_seconds, 4
+                                                ),
+                                                "document_window_pages": (
+                                                    PDF_PAGE_PREFILTER_DOCUMENT_WINDOW_PAGES
+                                                ),
+                                                "windowed_prefilter_quote_hit": (
+                                                    windowed_prefilter_quote_hit
+                                                ),
+                                            },
+                                        )
+                                        if not windowed_prefilter_quote_hit:
+                                            selected_pages_for_extract = None
+                                            await process.log(
+                                                "Windowed PDF prefilter found no LLM quotes "
+                                                "after all windows and term rounds; "
+                                                "falling back to full span extraction.",
+                                                data={
+                                                    "prefilter_term_rounds": (
+                                                        PDF_QUOTES_QUERY_TERM_REGEN_MAX_ATTEMPTS
+                                                    ),
+                                                },
+                                            )
+                                    else:
+                                        await process.log(
+                                            "PDF page prefilter starting",
+                                            data={
+                                                "prefilter_terms_count": len(
+                                                    prefilter_terms
+                                                ),
+                                                "prefilter_page_span_first": span_first,
+                                                "prefilter_page_span_last": span_last,
+                                                "prefilter_neighbor_radius": (
+                                                    PDF_PAGE_PREFILTER_NEIGHBOR_RADIUS
+                                                ),
+                                                "progress_heartbeat_interval_s": (
+                                                    PDF_STAGE_LOADING_HEARTBEAT_INTERVAL_S
+                                                ),
+                                            },
+                                        )
+                                        selected_pages_for_extract = (
+                                            await asyncio.to_thread(
+                                                search_pdf_pages_by_terms,
+                                                downloaded_path,
+                                                prefilter_terms,
+                                                start_page=span_first,
+                                                end_page=span_last,
+                                                max_pages=None,
+                                                include_neighbor_radius=(
+                                                    PDF_PAGE_PREFILTER_NEIGHBOR_RADIUS
+                                                ),
+                                            )
+                                        )
+                                        prefilter_seconds = (
+                                            time.perf_counter() - prefilter_start
+                                        )
+                                        await process.log(
+                                            "PDF page prefilter complete",
+                                            data={
+                                                "prefilter_terms_count": len(
+                                                    prefilter_terms
+                                                ),
+                                                "prefilter_selected_pages_count": len(
+                                                    selected_pages_for_extract or []
+                                                ),
+                                                "prefilter_selected_pages": (
+                                                    selected_pages_for_extract or []
+                                                ),
+                                                "prefilter_seconds": round(
+                                                    prefilter_seconds, 4
+                                                ),
+                                            },
+                                        )
+                                except Exception as prefilter_exc:
+                                    selected_pages_for_extract = None
+                                    await process.log(
+                                        f"PDF page prefilter failed; using full span extraction: {prefilter_exc}"
+                                    )
+                                finally:
+                                    stop_prefilter_heartbeat.set()
+                                    await prefilter_heartbeat_task
+                                if (
+                                    not selected_pages_for_extract
+                                    and not used_document_window_prefilter
+                                ):
+                                    await process.log(
+                                        "PDF page prefilter found no matches; falling back to full span extraction."
+                                    )
+                                    selected_pages_for_extract = None
+
+                        quote_terms_client = OpenAI(timeout=OPENAI_PDF_QUOTES_TIMEOUT)
+
+                        async def run_quote_extraction_with_regen(
+                            structured_blocks_in: list[dict],
+                            ext_first: int,
+                            ext_last: int,
+                            page_table_csv_in: dict[int, Any],
+                            embedded_images_by_page_in: dict[int, list[dict[str, str]]],
+                        ) -> tuple[list[dict], float, dict[str, Any], int]:
+                            qf_out: list[dict] = []
+                            fuzzy_accum = 0.0
+                            stats_out: dict[str, Any] = {}
+                            term_keys: set[str] = {
+                                str(t).strip().lower()
+                                for t in (prefilter_terms or [])
+                                if str(t).strip()
+                            }
+                            attempt_loc = 0
+                            run_count = 0
+                            while attempt_loc < PDF_QUOTES_QUERY_TERM_REGEN_MAX_ATTEMPTS:
+                                run_count += 1
+                                if attempt_loc > 0:
+                                    new_terms = await self._generate_query_terms_with_llm(
+                                        process=process,
+                                        client=quote_terms_client,
+                                        model_name=QUOTE_EXTRACTION_MODEL,
+                                        request=request,
+                                        already_used_terms=sorted(term_keys),
+                                    )
+                                    if not new_terms:
+                                        await process.log(
+                                            "Quote term regeneration returned no new terms; "
+                                            "stopping quote retries."
+                                        )
+                                        break
+                                    for t in new_terms:
+                                        lk = str(t).strip().lower()
+                                        if lk:
+                                            term_keys.add(lk)
+                                    terms_for_quotes = new_terms
+                                    await process.log(
+                                        "Regenerated retrieval terms for quote extraction retry",
+                                        data={
+                                            "retry_round": attempt_loc,
+                                            "terms": new_terms,
+                                        },
+                                    )
+                                else:
+                                    terms_for_quotes = list(prefilter_terms or [])
+
+                                qf_try, fuzzy_sec, q_st = (
+                                    await self._extract_quotes_from_structured_blocks(
+                                        process=process,
+                                        request=request,
+                                        structured_blocks=structured_blocks_in,
+                                        source_library=library,
+                                        source_url=pdf_url,
+                                        retrieval_terms=terms_for_quotes,
+                                        pdf_path=downloaded_path,
+                                        span_first=ext_first,
+                                        span_last=ext_last,
+                                        page_table_csv=page_table_csv_in,
+                                        embedded_images_by_page=embedded_images_by_page_in,
+                                    )
+                                )
+                                qf_out = qf_try
+                                fuzzy_accum += float(fuzzy_sec)
+                                stats_out = q_st
+                                if self._quote_findings_have_llm_reason(qf_out):
+                                    break
+                                attempt_loc += 1
+                            return qf_out, fuzzy_accum, stats_out, run_count
+
+                        prefilter_pages_full: list[int] = list(
+                            selected_pages_for_extract or []
+                        )
+                        use_prefilter_quote_batches = (
+                            (not windowed_prefilter_quote_hit)
+                            and selected_pages_for_extract is not None
+                            and len(prefilter_pages_full)
+                            > PDF_PAGE_PREFILTER_QUOTE_SCAN_BATCH_SIZE
+                        )
 
                         stop_parse_heartbeat = asyncio.Event()
                         parse_heartbeat_task = asyncio.create_task(
@@ -818,26 +1270,153 @@ class PDFReaderAgent(IChatBioAgent):
                                 process,
                                 stop_parse_heartbeat,
                                 "Extracting PDF content with pymupdf4llm_json",
+                                PDF_STAGE_LOADING_HEARTBEAT_INTERVAL_S,
                             )
                         )
                         try:
-                            (
-                                elements,
-                                text_length,
-                                page_table_csv,
-                                embedded_images_by_page,
-                            ) = await asyncio.to_thread(
-                                read_pdf_with_pymupdf4llm_json,
-                                downloaded_path,
-                                start_page,
-                                end_page_effective,
-                                max_pages_effective,
-                            )
+                            if windowed_prefilter_quote_hit:
+                                pass
+                            elif use_prefilter_quote_batches:
+                                await process.log(
+                                    "PDF prefilter returned many pages; scanning in batches "
+                                    f"of {PDF_PAGE_PREFILTER_QUOTE_SCAN_BATCH_SIZE} for quotes",
+                                    data={
+                                        "prefilter_selected_pages_total": len(
+                                            prefilter_pages_full
+                                        ),
+                                        "batch_size": PDF_PAGE_PREFILTER_QUOTE_SCAN_BATCH_SIZE,
+                                    },
+                                )
+                                extraction_time = 0.0
+                                merged_el: list[dict[str, Any]] = []
+                                merged_tl = 0
+                                merged_ptc: dict[int, str] = {}
+                                merged_emb: dict[int, list[dict[str, str]]] = {}
+                                elements = None
+                                text_length = 0
+                                page_table_csv = {}
+                                embedded_images_by_page = {}
+                                extract_first_effective = span_first
+                                extract_last_effective = span_last
+                                n_batches = (
+                                    len(prefilter_pages_full)
+                                    + PDF_PAGE_PREFILTER_QUOTE_SCAN_BATCH_SIZE
+                                    - 1
+                                ) // PDF_PAGE_PREFILTER_QUOTE_SCAN_BATCH_SIZE
+                                batch_idx = 0
+                                for batch_start in range(
+                                    0,
+                                    len(prefilter_pages_full),
+                                    PDF_PAGE_PREFILTER_QUOTE_SCAN_BATCH_SIZE,
+                                ):
+                                    batch_idx += 1
+                                    batch_pages = prefilter_pages_full[
+                                        batch_start : batch_start
+                                        + PDF_PAGE_PREFILTER_QUOTE_SCAN_BATCH_SIZE
+                                    ]
+                                    batch_t0 = time.perf_counter()
+                                    el_b, tl_b, ptc_b, emb_b = await asyncio.to_thread(
+                                        read_pdf_with_pymupdf4llm_json,
+                                        downloaded_path,
+                                        start_page,
+                                        end_page_effective,
+                                        max_pages_effective,
+                                        batch_pages,
+                                    )
+                                    extraction_time += time.perf_counter() - batch_t0
+                                    if not el_b:
+                                        continue
+                                    merged_el.extend(el_b)
+                                    merged_tl += tl_b
+                                    merged_ptc.update(ptc_b or {})
+                                    for pk, pv in (emb_b or {}).items():
+                                        merged_emb.setdefault(pk, []).extend(
+                                            pv or []
+                                        )
+                                    emb_grp = _embedded_images_grouped_by_page(emb_b)
+                                    structured_blocks_batch = (
+                                        self._prepare_structured_blocks_from_elements(
+                                            el_b, library
+                                        )
+                                    )
+                                    ext_first_b = min(batch_pages)
+                                    ext_last_b = max(batch_pages)
+                                    await process.log(
+                                        "PDF prefilter quote-scan batch",
+                                        data={
+                                            "batch_index": batch_idx,
+                                            "batch_count": n_batches,
+                                            "batch_page_count": len(batch_pages),
+                                        },
+                                    )
+                                    q_batch_t0 = time.perf_counter()
+                                    (
+                                        quote_findings,
+                                        fuzzy_b,
+                                        quote_extraction_stats,
+                                        quote_extraction_run_count,
+                                    ) = await run_quote_extraction_with_regen(
+                                        structured_blocks_batch,
+                                        ext_first_b,
+                                        ext_last_b,
+                                        ptc_b or {},
+                                        emb_grp,
+                                    )
+                                    fuzzy_search_seconds += float(fuzzy_b)
+                                    quote_extraction_seconds += (
+                                        time.perf_counter() - q_batch_t0
+                                    )
+                                    if self._quote_findings_have_llm_reason(
+                                        quote_findings
+                                    ):
+                                        elements = el_b
+                                        text_length = tl_b
+                                        page_table_csv = ptc_b or {}
+                                        embedded_images_by_page = emb_grp
+                                        extract_first_effective = ext_first_b
+                                        extract_last_effective = ext_last_b
+                                        structured_blocks = structured_blocks_batch
+                                        skip_default_quote_loop = True
+                                        break
+                                else:
+                                    elements = merged_el
+                                    text_length = merged_tl
+                                    page_table_csv = merged_ptc
+                                    embedded_images_by_page = (
+                                        _embedded_images_grouped_by_page(merged_emb)
+                                    )
+                                    extract_first_effective = min(prefilter_pages_full)
+                                    extract_last_effective = max(prefilter_pages_full)
+                            else:
+                                (
+                                    elements,
+                                    text_length,
+                                    page_table_csv,
+                                    embedded_images_by_page,
+                                ) = await asyncio.to_thread(
+                                    read_pdf_with_pymupdf4llm_json,
+                                    downloaded_path,
+                                    start_page,
+                                    end_page_effective,
+                                    max_pages_effective,
+                                    selected_pages_for_extract,
+                                )
+                                extraction_time = (
+                                    time.perf_counter() - pymupdf4llm_start_time
+                                )
+                                extract_first_effective = span_first
+                                extract_last_effective = span_last
+                                if selected_pages_for_extract:
+                                    extract_first_effective = min(
+                                        selected_pages_for_extract
+                                    )
+                                    extract_last_effective = max(
+                                        selected_pages_for_extract
+                                    )
                         finally:
                             stop_parse_heartbeat.set()
                             await parse_heartbeat_task
 
-                        extraction_time = time.perf_counter() - pymupdf4llm_start_time
                         await process.log(
                             f"PDF extraction processing time: {extraction_time:.3f} seconds",
                             # data={
@@ -865,10 +1444,12 @@ class PDFReaderAgent(IChatBioAgent):
                             },
                         )
 
-                        structured_blocks = self._build_structured_blocks(elements, library)
-                        for blk in structured_blocks:
-                            if blk.get("type") == "text" and isinstance(blk.get("text"), str):
-                                blk["text"] = clean_pdf_extracted_text(blk["text"])
+                        if not skip_default_quote_loop:
+                            structured_blocks = (
+                                self._prepare_structured_blocks_from_elements(
+                                    elements, library
+                                )
+                            )
 
                         table_count_from_elements = sum(
                             1
@@ -909,25 +1490,33 @@ class PDFReaderAgent(IChatBioAgent):
                         #     },
                         # )
 
-                        quote_findings: list[dict] = []
-                        quote_extract_start = time.perf_counter()
-                        (
-                            quote_findings,
-                            fuzzy_search_seconds,
-                            quote_extraction_stats,
-                        ) = await self._extract_quotes_from_structured_blocks(
-                            process=process,
-                            request=request,
-                            structured_blocks=structured_blocks,
-                            source_library=library,
-                            source_url=pdf_url,
-                            pdf_path=downloaded_path,
-                            span_first=span_first,
-                            span_last=span_last,
-                            page_table_csv=page_table_csv,
-                            embedded_images_by_page=embedded_images_by_page,
+                        if not skip_default_quote_loop:
+                            qts = time.perf_counter()
+                            (
+                                quote_findings,
+                                fz_more,
+                                quote_extraction_stats,
+                                quote_extraction_run_count,
+                            ) = await run_quote_extraction_with_regen(
+                                structured_blocks,
+                                extract_first_effective,
+                                extract_last_effective,
+                                page_table_csv,
+                                embedded_images_by_page,
+                            )
+                            fuzzy_search_seconds += float(fz_more)
+                            quote_extraction_seconds += time.perf_counter() - qts
+
+                        quote_extraction_stats = dict(quote_extraction_stats or {})
+                        # quote_extraction_stats["query_term_regen_enabled"] = (
+                        #     PDF_QUOTES_REGEN_TERMS_ON_EMPTY_MISS
+                        # )
+                        quote_extraction_stats["query_term_regen_max_attempts"] = (
+                            PDF_QUOTES_QUERY_TERM_REGEN_MAX_ATTEMPTS
                         )
-                        quote_extraction_seconds = time.perf_counter() - quote_extract_start
+                        quote_extraction_stats["quote_extraction_run_count"] = (
+                            quote_extraction_run_count
+                        )
                         total_pdf_pipeline_seconds = (
                             time.perf_counter() - pdf_pipeline_start
                         )
@@ -969,8 +1558,9 @@ class PDFReaderAgent(IChatBioAgent):
                             "image_output_dir": "",
                             "image_error": "",
                             "total_pdf_pages": total_pdf_pages,
-                            "extract_first_page": span_first,
-                            "extract_last_page": span_last,
+                            "extract_first_page": extract_first_effective,
+                            "extract_last_page": extract_last_effective,
+                            "prefilter_selected_pages": selected_pages_for_extract or [],
                             "timing_seconds": {
                                 "pymupdf4llm_extract": round(extraction_time, 4),
                                 "image_extract": round(image_extraction_seconds, 4),
@@ -1008,8 +1598,8 @@ class PDFReaderAgent(IChatBioAgent):
                                 candidate_images = _collect_figure_embedded_images(
                                     images_by_page_art,
                                     [page_num],
-                                    span_first=span_first,
-                                    span_last=span_last,
+                                    span_first=extract_first_effective,
+                                    span_last=extract_last_effective,
                                 )
                                 for embedded in candidate_images[:max_fig_art]:
                                     if not isinstance(embedded, dict):
@@ -1131,6 +1721,12 @@ class PDFReaderAgent(IChatBioAgent):
                         el = result.get("extract_last_page")
                         if tp is not None and ef is not None and el is not None:
                             summary += f"  - Pages extracted: {ef}-{el} (of {tp} total)\n"
+                        selected_pages = result.get("prefilter_selected_pages") or []
+                        if isinstance(selected_pages, list) and selected_pages:
+                            summary += (
+                                "  - Keyword prefilter selected pages: "
+                                f"{', '.join(str(p) for p in selected_pages)}\n"
+                            )
                         summary += f"  - Elements extracted: {result.get('total_elements', 0)}\n"
                         summary += f"  - Text length: {result.get('text_length', 0):,} characters\n"
                         element_types = result.get('element_types', {})
@@ -1355,6 +1951,343 @@ class PDFReaderAgent(IChatBioAgent):
 
         return structured
 
+    def _prepare_structured_blocks_from_elements(
+        self, elements: list[Any], library: str
+    ) -> list[dict]:
+        structured_blocks = self._build_structured_blocks(elements, library)
+        for blk in structured_blocks:
+            if blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                blk["text"] = clean_pdf_extracted_text(blk["text"])
+        self._apply_running_headers(structured_blocks)
+        self._apply_running_footers(structured_blocks)
+        self._extract_figures_to_field(structured_blocks)
+        self._join_incomplete_sentences(structured_blocks)
+        for blk in structured_blocks:
+            if isinstance(blk, dict):
+                self._canonicalize_block_field_order(blk)
+        return structured_blocks
+
+    @staticmethod
+    def _looks_like_running_header(candidate: str) -> bool:
+        """Conservative gate so body paragraphs aren't mistaken for running headers."""
+        s = (candidate or "").strip()
+        if not s:
+            return False
+        # Running headers in PDFs are short (typically 1-3 lines, < ~250 chars).
+        # Anything longer is almost certainly body text that happens to begin
+        # the page, separated from the rest by a paragraph break.
+        if len(s) > 250:
+            return False
+        if s.count("\n") > 3:
+            return False
+        return True
+
+    def _apply_running_headers(self, structured_blocks: list[dict]) -> None:
+        """Detect repeating per-page running headers in text blocks.
+
+        For each text block we treat the substring before the first ``\\n\\n``
+        as a candidate header. The candidate is stripped from ``text`` in place,
+        and a new ``header`` field is added only when the header changes from
+        the previously seen one (so duplicate running headers across pages
+        appear exactly once).
+        """
+        prev_header: Optional[str] = None
+        for block in structured_blocks or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "text":
+                continue
+            text = block.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            split_idx = text.find("\n\n")
+            if split_idx == -1:
+                continue
+            candidate = text[:split_idx].strip()
+            if not self._looks_like_running_header(candidate):
+                continue
+            remainder = text[split_idx + 2 :].lstrip("\n")
+            if candidate != prev_header:
+                # Rebuild so "header" sits between "type" and "text" in the
+                # emitted JSON (matches the documented schema shape).
+                rebuilt: dict = {"type": block["type"], "header": candidate, "text": remainder}
+                for key, value in block.items():
+                    if key in rebuilt:
+                        continue
+                    rebuilt[key] = value
+                block.clear()
+                block.update(rebuilt)
+                prev_header = candidate
+            else:
+                block["text"] = remainder
+
+    @staticmethod
+    def _strip_trailing_page_number(text: str, page_number: Any) -> str:
+        """Drop a trailing ``\\n\\n<digits>`` page-number block from page text.
+
+        Pymupdf often emits the printed page number as the last paragraph
+        (e.g. ``...\\n\\n5``). The information already lives in ``page_number``
+        and only confuses footer detection, so peel it off when present.
+        """
+        if not isinstance(text, str) or not text:
+            return text
+        last_split = text.rfind("\n\n")
+        if last_split == -1:
+            return text
+        tail = text[last_split + 2 :].strip()
+        if not tail.isdigit():
+            return text
+        if isinstance(page_number, int) and page_number > 0:
+            if str(page_number) != tail:
+                return text
+        else:
+            if not (1 <= len(tail) <= 4):
+                return text
+        return text[:last_split].rstrip()
+
+    def _apply_running_footers(self, structured_blocks: list[dict]) -> None:
+        """Detect repeating per-page running footers in text blocks.
+
+        Mirror of :meth:`_apply_running_headers` but for the trailing edge of
+        each text block. The substring after the last ``\\n\\n`` (after first
+        peeling off any standalone page-number block) is the candidate footer.
+        It is removed from ``text`` in place, and a new ``footer`` field is
+        added only when the footer differs from the previously seen one, so
+        duplicate running footers across pages appear exactly once.
+        """
+        prev_footer: Optional[str] = None
+        for block in structured_blocks or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") != "text":
+                continue
+            text = block.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            page_number = block.get("page_number")
+
+            cleaned = self._strip_trailing_page_number(text, page_number)
+            split_idx = cleaned.rfind("\n\n")
+            if split_idx == -1:
+                if cleaned != text:
+                    block["text"] = cleaned
+                continue
+
+            candidate = cleaned[split_idx + 2 :].strip()
+            if not self._looks_like_running_header(candidate):
+                if cleaned != text:
+                    block["text"] = cleaned
+                continue
+
+            remainder = cleaned[:split_idx].rstrip()
+            if candidate != prev_footer:
+                # Rebuild so the field order is: type, header, text, footer,
+                # page_number, … — header and footer naturally bracket text.
+                rebuilt: dict = {"type": block["type"]}
+                if "header" in block:
+                    rebuilt["header"] = block["header"]
+                rebuilt["text"] = remainder
+                rebuilt["footer"] = candidate
+                for key, value in block.items():
+                    if key in rebuilt:
+                        continue
+                    rebuilt[key] = value
+                block.clear()
+                block.update(rebuilt)
+                prev_footer = candidate
+            else:
+                block["text"] = remainder
+
+    # Match a figure caption paragraph (anchored to start-of-text or a
+    # preceding ``\n\n``). The caption header is ``Figure N`` or ``Fig. N``
+    # — optionally with a sub-letter (e.g. ``Figure 2A.``) — and runs until
+    # the next paragraph break or end-of-text.
+    _FIGURE_PATTERN = re.compile(
+        r"(?:(?<=\n\n)|^)((?:Figure|Fig)\.?\s+\d+[A-Za-z]?\.\s+.*?)(?:\n\n|\Z)",
+        re.DOTALL,
+    )
+    # ``{figN}`` placeholders written by ``_extract_figures_to_field`` (N indexes ``figures``).
+    _FIG_PLACEHOLDER_RE = re.compile(r"\{fig(\d+)\}", re.IGNORECASE)
+
+    def _extract_figures_to_field(self, structured_blocks: list[dict]) -> None:
+        """Move figure-caption paragraphs out of ``text`` into a ``figures`` array.
+
+        Each detected caption is replaced in ``text`` by a ``{figN}``
+        placeholder so the original caption can be re-substituted later
+        (e.g. before sending text to an LLM). ``N`` is the caption's index in
+        the per-block ``figures`` array, starting at 0.
+        """
+        for block in structured_blocks or []:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            text = block.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            figures: list[str] = []
+
+            def _capture(match: "re.Match[str]") -> str:
+                figures.append(match.group(1).strip())
+                return f"{{fig{len(figures) - 1}}} "
+
+            new_text = self._FIGURE_PATTERN.sub(_capture, text).rstrip()
+            if not figures:
+                continue
+            block["figures"] = figures
+            block["text"] = new_text
+
+    @staticmethod
+    def _expand_figure_placeholders_in_text(text: str, figures: Any) -> str:
+        """Replace ``{figN}`` with ``figures[N]`` before LLM-facing page/chunk text."""
+        if not isinstance(text, str) or not text:
+            return text if isinstance(text, str) else ""
+        if not isinstance(figures, list) or not figures:
+            return text
+
+        def _repl(m: re.Match[str]) -> str:
+            try:
+                idx = int(m.group(1))
+            except ValueError:
+                return m.group(0)
+            if idx < 0 or idx >= len(figures):
+                return m.group(0)
+            cap = figures[idx]
+            if isinstance(cap, str):
+                s = cap.strip()
+            else:
+                s = str(cap).strip() if cap is not None else ""
+            return s if s else m.group(0)
+
+        return PDFReaderAgent._FIG_PLACEHOLDER_RE.sub(_repl, text)
+
+    @staticmethod
+    def _is_incomplete_for_join(text: str) -> bool:
+        """True when a page's text appears to be cut off mid-sentence.
+
+        Used to decide whether to pull the first sentence of the next page up
+        to complete the trailing one. Only treat as incomplete when:
+          * The text has a non-empty trailing chunk.
+          * That trailing chunk is long enough to plausibly be body text
+            (i.e. not a section heading like "Materials and methods").
+          * The last visible character is not a sentence terminator.
+        """
+        s = (text or "").rstrip()
+        if not s:
+            return False
+        last_para_start = s.rfind("\n\n")
+        last_para = s[last_para_start + 2 :] if last_para_start != -1 else s
+        if len(last_para.strip()) < 50:
+            return False
+        return s[-1] not in ".!?…"
+
+    @staticmethod
+    def _split_leading_placeholders(text: str) -> tuple[str, str]:
+        """Return ``(leading, body)`` where ``leading`` is the run of
+        ``{figN}`` placeholders (with surrounding whitespace) at the very
+        start of the text, and ``body`` is everything after.
+        """
+        if not text:
+            return "", text
+        match = re.match(r"^(?:\s*\{fig\d+\})*\s*", text)
+        end = match.end() if match else 0
+        return text[:end], text[end:]
+
+    @staticmethod
+    def _find_first_sentence_end(body: str) -> int:
+        """Return the position right after the first sentence terminator
+        whose neighbour confirms it actually ends a sentence (followed by
+        whitespace + an uppercase letter / opening bracket / placeholder, or
+        end-of-string). Returns ``-1`` when no qualifying terminator exists.
+        """
+        if not body:
+            return -1
+        pattern = re.compile(r"[.!?…](?=\s+[A-Z(\[{]|\s*\Z)")
+        match = pattern.search(body)
+        return match.end() if match is not None else -1
+
+    @staticmethod
+    def _page_number_for_sentence_join(block: dict) -> int | None:
+        """Return a 1-based page index for merge logic, or None if unusable."""
+        pn = block.get("page_number")
+        if pn is None:
+            return None
+        try:
+            return max(int(pn), 1)
+        except (TypeError, ValueError):
+            return None
+
+    def _join_incomplete_sentences(self, structured_blocks: list[dict]) -> None:
+        """Stitch sentences cut off by a page break.
+
+        When a text block ends mid-sentence, copy the first sentence from the
+        next text block (after any leading ``{figN}`` placeholders, which stay
+        in place) onto the end of the current block so the truncated sentence
+        becomes complete. The placeholder is intentionally left where it is —
+        only body content moves.
+
+        Merge only when the next text block is the **immediately following PDF
+        page** (``next_page == current_page + 1``). If intermediate pages were
+        dropped from ``structured_blocks`` (e.g. page 2 then page 4), do not
+        merge—the missing page may hold the real continuation.
+        """
+        blocks = list(structured_blocks or [])
+        for i in range(len(blocks) - 1):
+            cur = blocks[i]
+            nxt = blocks[i + 1]
+            if not (isinstance(cur, dict) and cur.get("type") == "text"):
+                continue
+            if not (isinstance(nxt, dict) and nxt.get("type") == "text"):
+                continue
+            cur_page = self._page_number_for_sentence_join(cur)
+            nxt_page = self._page_number_for_sentence_join(nxt)
+            if cur_page is None or nxt_page is None:
+                continue
+            if nxt_page != cur_page + 1:
+                continue
+            cur_text = cur.get("text") or ""
+            nxt_text = nxt.get("text") or ""
+            if not cur_text or not nxt_text:
+                continue
+            if not self._is_incomplete_for_join(cur_text):
+                continue
+            leading, body = self._split_leading_placeholders(nxt_text)
+            if not body.strip():
+                continue
+            sentence_end = self._find_first_sentence_end(body)
+            if sentence_end <= 0:
+                continue
+            first_sentence = body[:sentence_end].strip()
+            rest = body[sentence_end:].lstrip()
+            if not first_sentence:
+                continue
+            cur["text"] = cur_text.rstrip() + " " + first_sentence
+            if rest:
+                # Preserve original leading verbatim so any surrounding
+                # whitespace (single space vs. paragraph break) carries over.
+                nxt["text"] = leading + rest
+            else:
+                nxt["text"] = leading.rstrip()
+
+    @staticmethod
+    def _canonicalize_block_field_order(block: dict) -> None:
+        """Reorder a block's keys into the documented schema shape:
+        ``type, header, figures, text, footer, page_number, …rest``.
+
+        Each transform earlier in the pipeline only touches the fields it
+        owns, so this single pass at the end produces consistent JSON output
+        regardless of which fields were added by which step.
+        """
+        canonical = ("type", "header", "figures", "text", "footer", "page_number")
+        rebuilt: dict = {}
+        for key in canonical:
+            if key in block:
+                rebuilt[key] = block[key]
+        for key, value in block.items():
+            if key in rebuilt:
+                continue
+            rebuilt[key] = value
+        block.clear()
+        block.update(rebuilt)
+
     async def _download_pdf_from_artifact(
         self,
         artifact: Artifact,
@@ -1450,7 +2383,11 @@ class PDFReaderAgent(IChatBioAgent):
             btype = block.get("type")
             text = ""
             if btype == "text":
-                text = block.get("text") or ""
+                raw_t = block.get("text") or ""
+                text = self._expand_figure_placeholders_in_text(
+                    raw_t if isinstance(raw_t, str) else "",
+                    block.get("figures"),
+                )
             elif btype == "table":
                 body = block.get("table_body") or ""
                 if isinstance(body, str) and body.strip():
@@ -1481,7 +2418,7 @@ class PDFReaderAgent(IChatBioAgent):
             return 0.0, 0.0
         score = 0.0
         fuzzy_seconds = 0.0
-        for term in terms:
+        for term_idx, term in enumerate(terms):
             q = (term or "").strip().lower()
             if len(q) < 3:
                 continue
@@ -1494,11 +2431,23 @@ class PDFReaderAgent(IChatBioAgent):
             fuzzy_seconds += time.perf_counter() - fuzzy_start
             if not matches:
                 continue
-            best_dist = min(getattr(m, "dist", max_l) for m in matches)
-            term_weight = max(1.0, min(4.0, len(q) / 6.0))
-            score += len(matches) * term_weight
-            score += max(0.25, 1.5 - float(best_dist))
+            # Retrieval terms are ordered by relevance (index 0 is most relevant).
+            # Rank-based scoring: index 0 -> 16, index 1 -> 15, etc.
+            #
+            # We multiply by match count so repeated phrase occurrences still increase score.
+            rank_score = PDF_QUOTES_QUERY_TERM_COUNT - term_idx
+            if rank_score <= 0:
+                continue
+            score += float(len(matches)) * float(rank_score)
         return score, fuzzy_seconds
+
+    @staticmethod
+    def _quote_findings_have_llm_reason(findings: list[Any]) -> bool:
+        """True if any finding has a non-empty reason (LLM quote path); hint rows use ''."""
+        for f in findings or []:
+            if isinstance(f, dict) and str(f.get("reason") or "").strip():
+                return True
+        return False
 
     async def _generate_query_terms_with_llm(
         self,
@@ -1506,20 +2455,37 @@ class PDFReaderAgent(IChatBioAgent):
         client: OpenAI,
         model_name: str,
         request: str,
+        *,
+        already_used_terms: list[str] | None = None,
     ) -> list[str]:
         req = (request or "").strip()
         if not req:
             return []
+        banned: set[str] = set()
+        for t in already_used_terms or []:
+            s = str(t or "").strip()
+            if s:
+                banned.add(s.lower())
         sys_msg = (
             "Generate search terms for fuzzy retrieval from a PDF. "
             "Return ONLY JSON like {\"terms\": [\"...\", \"...\"]}. "
             "Include exact phrases, synonyms, abbreviations, and key entities. "
-            "Keep each term short (1-6 words), no duplicates."
+            "Keep each term short (1-6 words), no duplicates. "
+            "IMPORTANT: The order of terms MUST reflect relevance ranking for fuzzy scoring: "
+            "index 0 is the MOST relevant term, and later indices are progressively less relevant. "
+            "Do not repeat or trivially rephrase any term from the already-tried list "
+            "(case-insensitive); propose genuinely different surface forms and concepts."
         )
-        user_msg = (
-            f"User request:\n{req}\n\n"
-            f"Return up to {PDF_QUOTES_QUERY_TERM_COUNT} high-value retrieval terms."
-        )
+        user_parts = [
+            f"User request:\n{req}\n",
+            f"Return up to {PDF_QUOTES_QUERY_TERM_COUNT} high-value retrieval terms.",
+        ]
+        if banned:
+            user_parts.append(
+                "\nAlready-tried terms (must NOT appear again in output; avoid minor variants):\n"
+                + json.dumps(sorted(banned), ensure_ascii=False)
+            )
+        user_msg = "\n".join(user_parts)
         try:
             resp = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -1534,7 +2500,7 @@ class PDFReaderAgent(IChatBioAgent):
             parsed = _parse_json_object_from_response(content)
             raw_terms = parsed.get("terms", []) if isinstance(parsed, dict) else []
             out: list[str] = []
-            seen: set[str] = set()
+            seen: set[str] = set(banned)
             if isinstance(raw_terms, list):
                 for t in raw_terms:
                     s = str(t or "").strip()
@@ -1555,8 +2521,8 @@ class PDFReaderAgent(IChatBioAgent):
             return out
         except Exception as exc:
             await process.log(f"Term generation failed; using request fallback: {exc}")
-            fb = _retrieval_tokens_from_request(req, seen=set(), max_extra=24)
-            return fb if fb else ([req] if req else [])
+            fb = _retrieval_tokens_from_request(req, seen=set(banned), max_extra=24)
+            return fb if fb else ([req] if req and req.lower() not in banned else [])
 
     async def _extract_quotes_from_structured_blocks(
         self,
@@ -1565,6 +2531,7 @@ class PDFReaderAgent(IChatBioAgent):
         structured_blocks: list[dict],
         source_library: str | None = None,
         source_url: str | None = None,
+        retrieval_terms: list[str] | None = None,
         *,
         pdf_path: str | None = None,
         span_first: int | None = None,
@@ -1586,7 +2553,11 @@ class PDFReaderAgent(IChatBioAgent):
             btype = block.get("type")
             text = ""
             if btype == "text":
-                text = block.get("text") or ""
+                raw_t = block.get("text") or ""
+                text = self._expand_figure_placeholders_in_text(
+                    raw_t if isinstance(raw_t, str) else "",
+                    block.get("figures"),
+                )
             elif btype == "table":
                 body = block.get("table_body") or ""
                 if isinstance(body, str) and body.strip():
@@ -1735,19 +2706,21 @@ class PDFReaderAgent(IChatBioAgent):
 
             per_page_wall_seconds = time.perf_counter() - per_page_wall_start
 
-            if strategy == "chunked":
-                chunk_size = PDF_QUOTES_CHUNK_CHARS
+            if strategy in ("chunked", "chunked_tokens"):
                 scored_chunks: list[tuple[float, int, dict[str, Any]]] = []
-                retrieval_terms: list[str] = []
+                active_retrieval_terms: list[str] = [
+                    str(t).strip() for t in (retrieval_terms or []) if str(t).strip()
+                ]
                 page_texts_for_chunks: dict[int, str] = page_texts
 
                 page_score_lookup: dict[int, float] = {}
                 page_order_for_chunks: list[int] | None = None
 
                 if ENABLED_FUZZY_SEARCH:
-                    retrieval_terms = await self._generate_query_terms_with_llm(
-                        process, client, model_name, req
-                    )
+                    # if active_retrieval_terms:
+                        # await process.log(
+                        #     f"Reusing prefilter retrieval terms: {active_retrieval_terms}"
+                        # )
                     # Phase 1: fuzzy-score each page, sort by score (desc), then chunk in that order.
                     scored_pages: list[tuple[float, int]] = []
                     for p in sorted_pages:
@@ -1755,7 +2728,7 @@ class PDFReaderAgent(IChatBioAgent):
                         if max_chars_per_page > 0:
                             pt = pt[:max_chars_per_page]
                         score, fuzzy_seconds = self._score_chunk_by_terms(
-                            pt, retrieval_terms
+                            pt, active_retrieval_terms
                         )
                         fuzzy_search_seconds_total += fuzzy_seconds
                         scored_pages.append((score, p))
@@ -1767,53 +2740,82 @@ class PDFReaderAgent(IChatBioAgent):
                         {"page": p, "score": round(s, 6)}
                         for s, p in scored_pages[:PDF_QUOTES_TOP_SCORING_PAGES]
                     ]
-                    if ENABLED_EXHAUSTIVE_SEARCH:
-                        # Exhaustive mode: keep all pages that have at least one
-                        # "hit" by fuzzy scoring, ordered by score (desc).
-                        chosen_pages = [
-                            p
-                            for s, p in scored_pages
-                            if float(s) >= 1.0
-                        ][:PDF_QUOTES_TOP_SCORING_PAGES]
-                        if chosen_pages:
-                            page_order_for_chunks = chosen_pages
-                            page_texts_for_chunks = {
-                                p: page_texts[p] for p in page_order_for_chunks
-                            }
-                        else:
-                            # If no page reaches the threshold, fall back to legacy
-                            # behavior: chunk the full PDF in natural page order.
-                            page_texts_for_chunks = page_texts
-                            page_order_for_chunks = None
+                    best_page_score = scored_pages[0][0] if scored_pages else 0.0
+                    if best_page_score > 0.0:
+                        chosen = scored_pages[:PDF_QUOTES_TOP_SCORING_PAGES]
+                        page_order_for_chunks = [p for _s, p in chosen]
+                        page_texts_for_chunks = {
+                            p: page_texts[p] for p in page_order_for_chunks
+                        }
                     else:
-                        best_page_score = scored_pages[0][0] if scored_pages else 0.0
-                        if best_page_score > 0.0:
-                            chosen = scored_pages[:PDF_QUOTES_TOP_SCORING_PAGES]
-                            page_order_for_chunks = [p for _s, p in chosen]
-                            page_texts_for_chunks = {
-                                p: page_texts[p] for p in page_order_for_chunks
-                            }
-                        else:
-                            # No term hits: chunk the full PDF in natural page order (legacy behavior).
-                            page_texts_for_chunks = page_texts
-                            page_order_for_chunks = None
+                        # No term hits: chunk the full PDF in natural page order (legacy behavior).
+                        page_texts_for_chunks = page_texts
+                        page_order_for_chunks = None
 
-                llm_chunks = split_page_texts_into_quote_llm_chunks(
-                    page_texts_for_chunks,
-                    max_chars_per_page,
-                    chunk_size,
-                    page_iteration_order=page_order_for_chunks,
-                )
+                    await process.log(
+                        "Page fuzzy retrieval ranking prepared",
+                        data={
+                            "quote_extraction_strategy": strategy,
+                            "fuzzy_search_enabled": True,
+                            "page_first_fuzzy": True,
+                            "top_scoring_pages_limit": PDF_QUOTES_TOP_SCORING_PAGES,
+                            "retrieval_terms_count": len(active_retrieval_terms),
+                            "fuzzy_search_seconds": round(
+                                fuzzy_search_seconds_total, 4
+                            ),
+                            "selected_pages_with_scores": fuzzy_page_scores_used,
+                            "max_pages_to_search": PDF_QUOTES_MAX_SEARCH_PAGES,
+                            "batch_size": PDF_QUOTES_LLM_BATCH_SIZE,
+                        },
+                    )
+
+                if strategy == "chunked":
+                    llm_chunks = split_page_texts_into_quote_llm_chunks(
+                        page_texts_for_chunks,
+                        max_chars_per_page,
+                        PDF_QUOTES_CHUNK_CHARS,
+                        page_iteration_order=page_order_for_chunks,
+                    )
+                    await process.log(
+                        "Character-based chunking prepared for LLM",
+                        data={
+                            "quote_extraction_strategy": strategy,
+                            "chunk_count": len(llm_chunks),
+                        },
+                    )
+                else:
+                    try:
+                        llm_chunks, token_chunk_prep_log = (
+                            prepare_pdf_page_texts_token_chunks_for_llm(
+                                page_texts_for_chunks,
+                                max_chars_per_page=max_chars_per_page,
+                                page_iteration_order=page_order_for_chunks,
+                                chunk_size_tokens=PDF_QUOTES_CHUNK_SIZE_TOKENS,
+                                overlap_tokens=PDF_QUOTES_CHUNK_OVERLAP_TOKENS,
+                                tiktoken_model=PDF_QUOTES_TIKTOKEN_MODEL,
+                                system_message=system_message,
+                                user_message_prefix=user_message_prefix,
+                                estimated_output_tokens_per_chunk=PDF_QUOTES_EST_OUTPUT_TOKENS_PER_CHUNK,
+                                input_price_per_1m_tokens=PDF_QUOTES_EST_INPUT_PRICE_PER_1M,
+                                output_price_per_1m_tokens=PDF_QUOTES_EST_OUTPUT_PRICE_PER_1M,
+                            )
+                        )
+                    except ValueError as chunk_cfg_exc:
+                        await process.log(
+                            "Token chunking configuration error; fix overlap vs chunk size.",
+                            data={"error": str(chunk_cfg_exc)},
+                        )
+                        raise
+                    await process.log(
+                        "Token-based chunking prepared for LLM (tiktoken)",
+                        data=token_chunk_prep_log,
+                    )
                 progress["chunks_total"] = len(llm_chunks)
 
                 if ENABLED_FUZZY_SEARCH:
                     # Chunks are already ordered by page relevance; take the first K and
                     # attach scores as the sum of constituent page fuzzy scores.
-                    chunks_for_scoring = (
-                        llm_chunks
-                        if ENABLED_EXHAUSTIVE_SEARCH
-                        else llm_chunks[:PDF_QUOTES_TOP_SCORING_CHUNKS]
-                    )
+                    chunks_for_scoring = llm_chunks[:PDF_QUOTES_TOP_SCORING_CHUNKS]
                     for ch_i, ch in enumerate(chunks_for_scoring):
                         pages_in = [
                             int(p)
@@ -1832,26 +2834,61 @@ class PDFReaderAgent(IChatBioAgent):
                 else:
                     scored_chunks = [(1.0, ch_i, ch) for ch_i, ch in enumerate(llm_chunks)]
 
+                try:
+                    chunks_artifact_payload: dict[str, Any] = {
+                        "quote_extraction_strategy": strategy,
+                        "chunk_count": len(llm_chunks),
+                        "llm_chunks": llm_chunks,
+                    }
+                    # chunks_artifact_body = json.dumps(
+                    #     chunks_artifact_payload,
+                    #     ensure_ascii=False,
+                    #     indent=2,
+                    # )
+                    # await process.create_artifact(
+                    #     mimetype="application/json",
+                    #     description=(
+                    #         f"Quote LLM chunks ({strategy}) [{len(llm_chunks)} chunks]"
+                    #     ),
+                    #     content=(chunks_artifact_body + "\n").encode("utf-8"),
+                    #     metadata={
+                    #         "quote_extraction_strategy": strategy,
+                    #         "chunk_count": len(llm_chunks),
+                    #         "schema": "llm_chunks_v1",
+                    #     },
+                    # )
+                except Exception as art_exc:
+                    await process.log(
+                        f"Warning: Failed to create llm_chunks artifact: {art_exc}",
+                        data={"model": model_name},
+                    )
+
+                chunk_ranking_log_data: dict[str, Any] = {
+                    "quote_extraction_strategy": strategy,
+                    "fuzzy_search_enabled": ENABLED_FUZZY_SEARCH,
+                    "page_first_fuzzy": ENABLED_FUZZY_SEARCH,
+                    "top_scoring_pages_limit": PDF_QUOTES_TOP_SCORING_PAGES,
+                    "chunk_count": len(llm_chunks),
+                    "chunks_selected_for_llm": len(scored_chunks),
+                    "retrieval_terms_count": len(active_retrieval_terms),
+                    "fuzzy_search_seconds": round(fuzzy_search_seconds_total, 4),
+                    "max_pages_to_search": PDF_QUOTES_MAX_SEARCH_PAGES,
+                    "batch_size": PDF_QUOTES_LLM_BATCH_SIZE,
+                    "top_scoring_chunks_limit": PDF_QUOTES_TOP_SCORING_CHUNKS,
+                    "selected_chunks_with_scores": (
+                        fuzzy_chunk_scores_used if ENABLED_FUZZY_SEARCH else []
+                    ),
+                }
+                # When fuzzy is on, page scores are logged earlier ("Page fuzzy retrieval ranking prepared").
+                # Omit this key here so evals that scan newest-first logs still pick up the page log
+                # (they treat present-but-empty list as a hit).
+                if not ENABLED_FUZZY_SEARCH:
+                    chunk_ranking_log_data["selected_pages_with_scores"] = (
+                        fuzzy_page_scores_used
+                    )
                 await process.log(
                     "Chunk retrieval ranking prepared",
-                    data={
-                        "fuzzy_search_enabled": ENABLED_FUZZY_SEARCH,
-                        "page_first_fuzzy": ENABLED_FUZZY_SEARCH,
-                        "top_scoring_pages_limit": PDF_QUOTES_TOP_SCORING_PAGES,
-                        "chunk_count": len(llm_chunks),
-                        "chunks_selected_for_llm": len(scored_chunks),
-                        "retrieval_terms_count": len(retrieval_terms),
-                        "fuzzy_search_seconds": round(fuzzy_search_seconds_total, 4),
-                        "max_pages_to_search": PDF_QUOTES_MAX_SEARCH_PAGES,
-                        "batch_size": PDF_QUOTES_LLM_BATCH_SIZE,
-                        "top_scoring_chunks_limit": PDF_QUOTES_TOP_SCORING_CHUNKS,
-                        "selected_pages_with_scores": (
-                            fuzzy_page_scores_used if ENABLED_FUZZY_SEARCH else []
-                        ),
-                        "selected_chunks_with_scores": (
-                            fuzzy_chunk_scores_used if ENABLED_FUZZY_SEARCH else []
-                        ),
-                    },
+                    data=chunk_ranking_log_data,
                 )
 
                 t_chunked = time.perf_counter()
@@ -1908,7 +2945,7 @@ class PDFReaderAgent(IChatBioAgent):
                             )
                         except Exception as chunk_exc:
                             await process.log(
-                                f"Quote extraction (chunked strategy) failed on chunk "
+                                f"Quote extraction ({strategy} strategy) failed on chunk "
                                 f"{ch_i + 1}/{len(llm_chunks)}: {chunk_exc}",
                                 data={"model": model_name},
                             )
@@ -2010,7 +3047,7 @@ class PDFReaderAgent(IChatBioAgent):
                         break
                 chunked_wall = time.perf_counter() - t_chunked
                 await process.log(
-                    "Quote extraction (chunked strategy) complete",
+                    f"Quote extraction ({strategy} strategy) complete",
                     data={
                         "model": model_name,
                         "llm_requests": llm_request_count,

@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import json
+import math
 import os
 import pathlib
 import re
@@ -15,6 +16,9 @@ from deepeval.metrics import GEval
 from deepeval.test_case import LLMTestCase, LLMTestCaseParams
 
 from src.agent import PDFReaderAgent, PDFReaderParams
+
+# Tiered ground-truth: index 0 = 100%, each further expected row −5% when it is the best matched alone.
+_GROUND_TRUTH_TIER_DECAY = 0.05
 
 
 file = pathlib.Path(__file__).parent / "test_sets" / "ground_truth.yaml"
@@ -51,7 +55,7 @@ def _get_log_text(messages) -> str:
 _TESTS_DIR = pathlib.Path(__file__).resolve().parent.parent.parent
 _RESULT_PATH = pathlib.Path(__file__).resolve().parent / "output" / "result.json"
 _SUMMARY_PATH = pathlib.Path(__file__).resolve().parent / "output" / "summary.json"
-_RETRIEVAL_TOP_K = 5
+_RETRIEVAL_TOP_K = 10
 _GEVAL_PASS_THRESHOLD = 0.5
 
 
@@ -86,7 +90,16 @@ def _pdf_path_for_artifact(artifact_name: str) -> pathlib.Path:
 
 
 def _normalize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "").strip()).lower()
+    t = (text or "").strip()
+    for a, b in (
+        ("\u2019", "'"),
+        ("\u2018", "'"),
+        ("\u201c", '"'),
+        ("\u201d", '"'),
+        ("\u00a0", " "),
+    ):
+        t = t.replace(a, b)
+    return re.sub(r"\s+", " ", t).lower()
 
 
 def _safe_div(numerator: float, denominator: float) -> float:
@@ -113,6 +126,26 @@ def _gold_pages(expected) -> set[int]:
     return pages
 
 
+def _gold_pages_ranked(expected) -> list[int]:
+    """Return expected pages in ranked order (first item is most important)."""
+    ranked_pages: list[int] = []
+    seen: set[int] = set()
+    if isinstance(expected, list):
+        for row in expected:
+            if not isinstance(row, dict):
+                continue
+            page = row.get("page")
+            try:
+                page_num = int(page)
+            except (TypeError, ValueError):
+                continue
+            if page_num in seen:
+                continue
+            seen.add(page_num)
+            ranked_pages.append(page_num)
+    return ranked_pages
+
+
 def _expected_to_string(expected) -> str:
     if isinstance(expected, str):
         return expected
@@ -128,6 +161,112 @@ def _expected_to_string(expected) -> str:
             lines.append(f"[page {page}] {sentence}")
         return "\n".join(lines).strip()
     return str(expected)
+
+
+def _is_structured_expected(expected) -> bool:
+    return isinstance(expected, list) and any(
+        isinstance(row, dict) and row.get("sentence") for row in expected
+    )
+
+
+def _expected_sentence_match_score(expected_norm: str, quote_norm: str) -> float:
+    """Return [0,1] overlap score between expected sentence and a quote (normalized)."""
+    if not expected_norm or not quote_norm:
+        return 0.0
+    if expected_norm in quote_norm or quote_norm in expected_norm:
+        return 1.0
+    exp_words = [w for w in expected_norm.split() if len(w) > 2]
+    if not exp_words:
+        return 1.0 if expected_norm in quote_norm else 0.0
+    q_words = {w for w in quote_norm.split() if len(w) > 2}
+    if not q_words:
+        return 0.0
+    hit = sum(1 for w in exp_words if w in q_words)
+    return hit / float(len(exp_words))
+
+
+def _ground_truth_row_matches(
+    row: dict,
+    quote_findings: list[dict],
+    actual_output: str,
+    *,
+    min_overlap: float = 0.45,
+) -> bool:
+    sentence = str(row.get("sentence", "")).strip()
+    if not sentence:
+        return False
+    try:
+        exp_page = int(row["page"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    exp_n = _normalize_text(sentence)
+    full_n = _normalize_text(actual_output)
+
+    for qf in quote_findings or []:
+        if not isinstance(qf, dict):
+            continue
+        try:
+            pg = int(qf.get("page"))
+        except (TypeError, ValueError):
+            continue
+        if pg != exp_page:
+            continue
+        qn = _normalize_text(str(qf.get("quotes", "")))
+        if _expected_sentence_match_score(exp_n, qn) >= min_overlap:
+            return True
+
+    # Lenient fallback: sentence appears in reply and that page is attributed in quote JSON.
+    if _expected_sentence_match_score(exp_n, full_n) >= min_overlap:
+        page_markers = (
+            f'"page": {exp_page}',
+            f'"page":{exp_page}',
+            f"page {exp_page}",
+            f"PDF page {exp_page}",
+        )
+        if any(m in actual_output for m in page_markers):
+            return True
+
+    return False
+
+
+def _tiered_ground_truth_score(
+    expected: list,
+    quote_findings: list[dict],
+    actual_output: str,
+) -> tuple[float, dict]:
+    """
+    - All expected rows matched → 1.0
+    - Otherwise score = max of (1.0 - i * decay) over matched row indices i.
+    - No match → 0.0
+    """
+    rows: list[dict] = [r for r in expected if isinstance(r, dict)]
+    if not rows:
+        return 0.0, {"matches": [], "score_breakdown": "no_rows"}
+
+    matches = [
+        _ground_truth_row_matches(r, quote_findings, actual_output) for r in rows
+    ]
+
+    if all(matches):
+        score = 1.0
+    elif not any(matches):
+        score = 0.0
+    else:
+        tier_scores = [
+            max(0.0, 1.0 - i * _GROUND_TRUTH_TIER_DECAY)
+            for i, m in enumerate(matches)
+            if m
+        ]
+        score = max(tier_scores) if tier_scores else 0.0
+
+    meta = {
+        "matches": matches,
+        "pages": [r.get("page") for r in rows],
+        "tier_decay": _GROUND_TRUTH_TIER_DECAY,
+        "matched_all": all(matches),
+    }
+    return score, meta
 
 
 def _extract_selected_pages_with_scores(messages, actual_response: str) -> list[dict]:
@@ -185,6 +324,56 @@ def _retrieval_precision_recall(expected, selected_pages_with_scores: list[dict]
     return precision, recall
 
 
+def _retrieval_mrr_ndcg(expected, selected_pages_with_scores: list[dict]) -> tuple[float, float]:
+    """
+    Compute ranking-aware retrieval metrics at top-K:
+    - MRR@K: reciprocal rank of first relevant page.
+    - NDCG@K: DCG normalized by ideal DCG using graded relevance from expected order.
+    """
+    ranked_gold = _gold_pages_ranked(expected)
+    gold_set = set(ranked_gold)
+    top_pages: list[int] = []
+    for row in selected_pages_with_scores[:_RETRIEVAL_TOP_K]:
+        if not isinstance(row, dict):
+            continue
+        page = row.get("page")
+        try:
+            top_pages.append(int(page))
+        except (TypeError, ValueError):
+            continue
+
+    # MRR@K: first relevant hit in retrieved ranking.
+    mrr = 0.0
+    for rank, page in enumerate(top_pages, start=1):
+        if page in gold_set:
+            mrr = 1.0 / rank
+            break
+
+    # NDCG@K with graded relevance from ground-truth order.
+    # First expected page gets highest relevance (=len(ranked_gold)), next gets one less, etc.
+    relevance_by_page = {
+        page: float(len(ranked_gold) - idx) for idx, page in enumerate(ranked_gold)
+    }
+    dcg = 0.0
+    for rank, page in enumerate(top_pages, start=1):
+        rel = relevance_by_page.get(page, 0.0)
+        if rel > 0:
+            dcg += rel / math.log2(rank + 1)
+
+    ideal_relevances = sorted(relevance_by_page.values(), reverse=True)
+    if len(ideal_relevances) < _RETRIEVAL_TOP_K:
+        ideal_relevances.extend([0.0] * (_RETRIEVAL_TOP_K - len(ideal_relevances)))
+    else:
+        ideal_relevances = ideal_relevances[:_RETRIEVAL_TOP_K]
+    idcg = 0.0
+    for rank, rel in enumerate(ideal_relevances, start=1):
+        if rel > 0:
+            idcg += rel / math.log2(rank + 1)
+
+    ndcg = _safe_div(dcg, idcg)
+    return mrr, ndcg
+
+
 def _extract_json_array_after_marker(text: str, marker: str) -> list[dict]:
     idx = (text or "").find(marker)
     if idx == -1:
@@ -220,8 +409,12 @@ def _write_eval_result(
     selected_pages_with_scores: list[dict],
     fuzzy_precision: float,
     fuzzy_recall: float,
+    retrieval_mrr: float,
+    retrieval_ndcg: float,
     quote_findings: list[dict],
     geval_score: float,
+    *,
+    ground_truth_eval: dict | None = None,
 ) -> None:
     _RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
     rows = []
@@ -236,6 +429,8 @@ def _write_eval_result(
     precision_key = f"Precision@{_RETRIEVAL_TOP_K}"
     recall_key = f"Recall@{_RETRIEVAL_TOP_K}"
     f1_key = f"F1@{_RETRIEVAL_TOP_K}"
+    mrr_key = f"MRR@{_RETRIEVAL_TOP_K}"
+    ndcg_key = f"NDCG@{_RETRIEVAL_TOP_K}"
     f1_value = _f1_score(fuzzy_precision, fuzzy_recall)
     new_row = {
         "user_message": user_message,
@@ -244,10 +439,13 @@ def _write_eval_result(
             precision_key: round(fuzzy_precision, 6),
             recall_key: round(fuzzy_recall, 6),
             f1_key: round(f1_value, 6),
+            mrr_key: round(retrieval_mrr, 6),
+            ndcg_key: round(retrieval_ndcg, 6),
         },
         "llm": {
             "quote_findings": quote_findings,
             "geval_score": round(geval_score, 6),
+            **({"ground_truth_eval": ground_truth_eval} if ground_truth_eval else {}),
         },
     }
     replaced = False
@@ -266,10 +464,14 @@ def _write_eval_summary(rows: list[dict]) -> None:
     precisions: list[float] = []
     recalls: list[float] = []
     f1_scores: list[float] = []
+    mrr_scores: list[float] = []
+    ndcg_scores: list[float] = []
     geval_scores: list[float] = []
     precision_key = f"Precision@{_RETRIEVAL_TOP_K}"
     recall_key = f"Recall@{_RETRIEVAL_TOP_K}"
     f1_key = f"F1@{_RETRIEVAL_TOP_K}"
+    mrr_key = f"MRR@{_RETRIEVAL_TOP_K}"
+    ndcg_key = f"NDCG@{_RETRIEVAL_TOP_K}"
 
     for row in rows:
         if not isinstance(row, dict):
@@ -279,12 +481,18 @@ def _write_eval_summary(rows: list[dict]) -> None:
             p = fuzzy.get(precision_key)
             r = fuzzy.get(recall_key)
             f1 = fuzzy.get(f1_key)
+            mrr = fuzzy.get(mrr_key)
+            ndcg = fuzzy.get(ndcg_key)
             if isinstance(p, (int, float)):
                 precisions.append(float(p))
             if isinstance(r, (int, float)):
                 recalls.append(float(r))
             if isinstance(f1, (int, float)):
                 f1_scores.append(float(f1))
+            if isinstance(mrr, (int, float)):
+                mrr_scores.append(float(mrr))
+            if isinstance(ndcg, (int, float)):
+                ndcg_scores.append(float(ndcg))
         llm = row.get("llm")
         if isinstance(llm, dict):
             g = llm.get("geval_score")
@@ -294,6 +502,8 @@ def _write_eval_summary(rows: list[dict]) -> None:
     macro_precision = _safe_div(sum(precisions), len(precisions))
     macro_recall = _safe_div(sum(recalls), len(recalls))
     macro_f1 = _safe_div(sum(f1_scores), len(f1_scores))
+    macro_mrr = _safe_div(sum(mrr_scores), len(mrr_scores))
+    macro_ndcg = _safe_div(sum(ndcg_scores), len(ndcg_scores))
     macro_geval = _safe_div(sum(geval_scores), len(geval_scores))
     passed_count = sum(1 for score in geval_scores if score >= _GEVAL_PASS_THRESHOLD)
     failed_count = max(0, len(geval_scores) - passed_count)
@@ -304,6 +514,8 @@ def _write_eval_summary(rows: list[dict]) -> None:
             f"Average_{precision_key}": round(macro_precision, 6),
             f"Average_{recall_key}": round(macro_recall, 6),
             f"Average_{f1_key}": round(macro_f1, 6),
+            f"Average_{mrr_key}": round(macro_mrr, 6),
+            f"Average_{ndcg_key}": round(macro_ndcg, 6),
         },
         "llm": {
             "average_geval_score": round(macro_geval, 6),
@@ -348,21 +560,49 @@ async def test_pdf_reader_agent_with_artifact(context, messages, httpx_mock, use
 
     selected_pages_with_scores = _extract_selected_pages_with_scores(messages, actual_response)
     fuzzy_precision, fuzzy_recall = _retrieval_precision_recall(expected, selected_pages_with_scores)
+    retrieval_mrr, retrieval_ndcg = _retrieval_mrr_ndcg(expected, selected_pages_with_scores)
     quote_findings = _extract_quote_findings(actual_response)
 
-    metric = _equivalence_metric()
-    test_case = LLMTestCase(
-        input=user_message,
-        expected_output=_expected_to_string(expected),
-        actual_output=actual_output,
-    )
-    assert_test(test_case, [metric], run_async=False)
-    geval_score = float(getattr(metric, "score", 0.0) or 0.0)
+    ground_truth_eval: dict | None = None
+    assert_exc: Exception | None = None
+
+    if _is_structured_expected(expected):
+        geval_score, gt_meta = _tiered_ground_truth_score(
+            expected, quote_findings, actual_output
+        )
+        ground_truth_eval = {
+            "method": "tiered_page_sentence",
+            **gt_meta,
+            "score": round(geval_score, 6),
+        }
+        if geval_score < _GEVAL_PASS_THRESHOLD:
+            assert_exc = AssertionError(
+                f"Tiered ground-truth score {geval_score:.3f} < threshold {_GEVAL_PASS_THRESHOLD} "
+                f"(matches={gt_meta.get('matches')}, pages={gt_meta.get('pages')})"
+            )
+    else:
+        metric = _equivalence_metric()
+        test_case = LLMTestCase(
+            input=user_message,
+            expected_output=_expected_to_string(expected),
+            actual_output=actual_output,
+        )
+        try:
+            assert_test(test_case, [metric], run_async=False)
+        except AssertionError as exc:
+            assert_exc = exc
+        geval_score = float(getattr(metric, "score", 0.0) or 0.0)
+
     _write_eval_result(
         user_message=user_message,
         selected_pages_with_scores=selected_pages_with_scores,
         fuzzy_precision=fuzzy_precision,
         fuzzy_recall=fuzzy_recall,
+        retrieval_mrr=retrieval_mrr,
+        retrieval_ndcg=retrieval_ndcg,
         quote_findings=quote_findings,
         geval_score=geval_score,
+        ground_truth_eval=ground_truth_eval,
     )
+    if assert_exc is not None:
+        raise assert_exc

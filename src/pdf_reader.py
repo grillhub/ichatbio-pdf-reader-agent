@@ -356,6 +356,81 @@ def render_pdf_page_to_png_bytes(
         doc.close()
 
 
+def search_pdf_pages_by_terms(
+    pdf_path: str,
+    terms: List[str],
+    *,
+    start_page: int = 1,
+    end_page: Optional[int] = None,
+    max_pages: Optional[int] = None,
+    include_neighbor_radius: int = 0,
+) -> List[int]:
+    if not PYMUPDF_AVAILABLE:
+        raise ImportError("PyMuPDF (fitz) is required for PDF page pre-search.")
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+
+    normalized_terms: List[str] = []
+    seen_terms: Set[str] = set()
+    for term in terms or []:
+        s = str(term or "").strip()
+        lk = s.lower()
+        if len(s) < 2 or lk in seen_terms:
+            continue
+        seen_terms.add(lk)
+        normalized_terms.append(s)
+    if not normalized_terms:
+        return []
+
+    doc = fitz.open(pdf_path)
+    try:
+        first, last = resolve_page_span(doc.page_count, start_page, end_page, max_pages)
+        matched_pages: Set[int] = set()
+        for page_num in range(first, last + 1):
+            page = doc[page_num - 1]
+            page_hit = False
+            for term in normalized_terms:
+                try:
+                    if page.search_for(term):
+                        page_hit = True
+                        break
+                except Exception:
+                    continue
+            if not page_hit:
+                try:
+                    page_text = page.get_text("text") or ""
+                except Exception:
+                    page_text = ""
+                if page_text:
+                    low = page_text.lower()
+                    for term in normalized_terms:
+                        t = term.lower()
+                        if t in low:
+                            page_hit = True
+                            break
+                        spaced = r"\s+".join(re.escape(p) for p in term.split() if p)
+                        if spaced and re.search(spaced, page_text, flags=re.IGNORECASE):
+                            page_hit = True
+                            break
+            if page_hit:
+                matched_pages.add(page_num)
+
+        if include_neighbor_radius > 0 and matched_pages:
+            expanded = set(matched_pages)
+            for page_num in list(matched_pages):
+                for delta in range(1, int(include_neighbor_radius) + 1):
+                    left = page_num - delta
+                    right = page_num + delta
+                    if first <= left <= last:
+                        expanded.add(left)
+                    if first <= right <= last:
+                        expanded.add(right)
+            matched_pages = expanded
+        return sorted(matched_pages)
+    finally:
+        doc.close()
+
+
 def read_pdf_with_pypdf(
     pdf_path: str,
     strategy: str = "auto",
@@ -475,7 +550,8 @@ def read_pdf_with_pymupdf4llm_json(
     pdf_path: str,
     start_page: int = 1,
     end_page: Optional[int] = None,
-    max_pages: Optional[int] = None
+    max_pages: Optional[int] = None,
+    selected_pages: Optional[List[int]] = None,
 ) -> Tuple[Optional[List[Dict[str, Any]]], int, Dict[int, str], Dict[int, List[Dict[str, str]]]]:
     if not PYMUPDF4LLM_AVAILABLE:
         raise ImportError(
@@ -485,9 +561,24 @@ def read_pdf_with_pymupdf4llm_json(
     if not os.path.exists(pdf_path):
         raise FileNotFoundError(f"PDF file not found: {pdf_path}")
 
+    selected_pages_1based: Optional[List[int]] = None
+    selected_pages_0based: Optional[List[int]] = None
+    if selected_pages:
+        selected_pages_1based = sorted(
+            {
+                int(p)
+                for p in selected_pages
+                if isinstance(p, int) and int(p) >= 1
+            }
+        )
+        selected_pages_0based = [p - 1 for p in selected_pages_1based]
+
     print(f"Parsing PDF with pymupdf4llm: {pdf_path}")
     try:
-        jsondata = pymupdf4llm.to_json(str(pdf_path), embed_images=True)
+        json_kwargs: Dict[str, Any] = {"embed_images": True}
+        if selected_pages_0based:
+            json_kwargs["pages"] = selected_pages_0based
+        jsondata = pymupdf4llm.to_json(str(pdf_path), **json_kwargs)
         if isinstance(jsondata, str):
             parsed = json.loads(jsondata)
         else:
@@ -505,18 +596,31 @@ def read_pdf_with_pymupdf4llm_json(
         print("Error parsing PDF with pymupdf4llm: pages is not a list")
         return None, 0, {}, {}
 
-    num_pages = len(pages)
-    if num_pages < 1:
+    parsed_page_count = len(pages)
+    if parsed_page_count < 1:
         return [], 0, {}, {}
-    first, last = resolve_page_span(num_pages, start_page, end_page, max_pages)
+    if selected_pages_1based:
+        page_numbers_to_process = list(selected_pages_1based)
+        first = min(page_numbers_to_process)
+        last = max(page_numbers_to_process)
+        source_total_pages = max(page_numbers_to_process)
+    else:
+        first, last = resolve_page_span(parsed_page_count, start_page, end_page, max_pages)
+        page_numbers_to_process = list(range(first, last + 1))
+        source_total_pages = parsed_page_count
 
     elements: List[Dict[str, Any]] = []
     page_table_csv: Dict[int, str] = {}
     page_embedded_images: Dict[int, List[Dict[str, str]]] = {}
     page_text_fragments: List[str] = []
 
-    for page_number in range(first, last + 1):
-        page_obj = pages[page_number - 1]
+    for local_idx, page_number in enumerate(page_numbers_to_process):
+        if selected_pages_1based:
+            if local_idx < 0 or local_idx >= len(pages):
+                continue
+            page_obj = pages[local_idx]
+        else:
+            page_obj = pages[page_number - 1]
         if not isinstance(page_obj, dict):
             continue
         boxes = page_obj.get("boxes") or []
@@ -619,7 +723,7 @@ def read_pdf_with_pymupdf4llm_json(
                     "page_number": page_number,
                     "metadata": {
                         "page_number": page_number,
-                        "total_pages": num_pages,
+                                "total_pages": source_total_pages,
                         "extract_first_page": first,
                         "extract_last_page": last,
                     },

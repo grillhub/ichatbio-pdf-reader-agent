@@ -16,6 +16,7 @@ dependencies = [
     "pymupdf4llm",
     "requests~=2.32.0",
     "fuzzysearch",
+    "tiktoken>=0.8.0",
     # "unstructured[pdf]",
     "pillow"
 ]
